@@ -28,6 +28,7 @@ This module ships seven models, split into focused per-model docs:
 - [`devrel:so101:calibration`](docs/calibration.md) — the calibration sensor workflow
 - [`devrel:so101:discovery`](docs/discovery.md) — the auto-discovery service
 - [`devrel:so101:teleop`](docs/teleop.md) — leader/follower teleoperation service
+- [`devrel:so101:teleop-cartesian`](docs/teleop-cartesian.md) — SO-101 leader driving a different arm (e.g. an xArm) in Cartesian space
 
 Also see:
 

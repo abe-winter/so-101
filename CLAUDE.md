@@ -8,13 +8,16 @@ the follower arm, or both as separate components for mirrored teleoperation.
 ## Layout
 
 ```
-cmd/module/            entrypoint; registers all seven models
+cmd/module/            entrypoint; registers all eight models
 components/arm/        devrel:so101:arm          — hardware arm, servos 1-5
 components/gripper/    devrel:so101:gripper      — hardware gripper, servo 6
 components/calibration/devrel:so101:calibration  — calibration sensor workflow
 components/simulated/  devrel:so101:simulated + :simulated-gripper
-services/teleop/       devrel:so101:teleop
+services/teleop/       devrel:so101:teleop       — joint-space mirror, identical arms
+services/cartesianteleop/ devrel:so101:teleop-cartesian — SO-101 leader → any arm, via the
+                       motion service teleop pipeline; thin wrapper over internal/cartesianteleop
 services/discovery/    devrel:so101:discovery
+cmd/teleop-client/     the Cartesian teleop engine run from a laptop over gRPC
 internal/controller/   ref-counted shared serial bus (registry, manager, bus session,
                        calibration file I/O, gripper travel guard)
 internal/servo/        servo primitives: MotorCalibration, CalibratedServo,
@@ -22,6 +25,8 @@ internal/servo/        servo primitives: MotorCalibration, CalibratedServo,
 internal/geometry/     kinematic model builders + all embedded assets
 internal/planning/     approach-axis goal clouds
 internal/servocmd/     the servo_* DoCommand wire protocol
+internal/cartesianteleop/ Cartesian mirror engine: mapping, best-effort IK (cgo-free DLS),
+                       time-normalised filter, motion-service teleop pipeline client, loop
 internal/testfake/     test doubles shared across package boundaries
 assets/urdf/           runtime-loaded URDF + collision meshes + SO-ARM100 license
 tools/                 mesh/URDF generator scripts
@@ -609,6 +614,32 @@ calibration wizard. It is bundled into `module.tar.gz` and needs **Node ≥ 20**
   limits (so101.json / URDF), point by point, and the stream is torn down client-side on a
   violation -- before any point reaches the module's `clampPositions`, which clamps to the
   CALIBRATED limits. Two different limit sets; in-process tests only ever see the second.
+- **`teleop-cartesian` has no clutch: on start the LEADER goes to the follower, never the
+  reverse.** `Engine.Start` (`internal/cartesianteleop/engine.go`) reads the follower's pose from
+  the motion service, maps it back through `Mapping.Inverse`, solves the leader's joints with
+  `SolveBestEffort`, drives the leader there blocking, applies `leader_hold`, and only then
+  registers the follower with the pipeline *at its current pose*. Because a 5-DoF leader cannot
+  reach a 6-DoF pose, the leftover gap is captured as a `Residual` (world-frame translation,
+  TOOL-frame rotation, right-multiplied) and applied to every target, so the first `teleop_move`
+  equals the follower's current pose and the big arm does not move on start.
+  `TestFirstMirroredTargetEqualsTheFollowersPoseEvenWhenTheLeaderCannotReachIt` pins this.
+  Note `engine.Config`'s zero value has `RotationEnabled: false`; build it with
+  `Settings.Resolve`, which defaults it true. Two tests once passed for the wrong reason because
+  of that zero value.
+- **`SolveBestEffort` is a hand-rolled damped-least-squares IK, on purpose.** rdk's
+  `motionplan/ik` is nlopt-backed and cgo-only (`solver_nocgo.go` / `!windows` build tags), and
+  this module ships a windows/amd64 target. Numerical Jacobian + LM damping + backtracking +
+  perturbed restarts; it never fails for an unreachable pose, it reports the residual. The
+  orientation residual is a world-frame rotation vector (`orientationError`); the mapping's
+  residual is tool-frame. Do not mix them up: the mapping test uses a non-identity "mapped"
+  orientation specifically because the two conventions agree at identity.
+- **The motion teleop pipeline is driven by protojson of the real request messages**
+  (`pipeline.go`), not hand-formatted strings like the vive module. `teleop_move` needs
+  `component_name` once more than one component is registered; `teleop_stop` with
+  `component_name` removes only that component. A `"not running"` error means the server-side
+  session is gone (`IsSessionLost`) and the loop stops itself, deliberately leaving the leader
+  HELD because a hand may be on it; `Stop` (or the next `Start`) releases it.
+  `sessionOpen` outlives `running` for exactly this reason.
 - **rdk ≥ v1.6.0's `Frame.Transform` does NOT bounds-check joints** (`OOBErrString` is dead
   upstream). On the WRITE path that makes `so101.clampPositions` the only joint-limit
   enforcement in this module -- do not "simplify it away" on the assumption that rdk rejects an

@@ -31,13 +31,13 @@ update:
 test:
 	go test ./...
 
-module.tar.gz: meta.json $(MODULE_BINARY) first_run.sh build-app $(RUNTIME_ASSETS)
+module.tar.gz: meta.json $(MODULE_BINARY) build-app $(RUNTIME_ASSETS)
 ifeq ($(VIAM_TARGET_OS), windows)
-	jq '.entrypoint = "./bin/arm.exe" | del(.first_run)' meta.json > temp.json && mv temp.json meta.json
+	jq '.entrypoint = "./bin/arm.exe"' meta.json > temp.json && mv temp.json meta.json
 else
 	strip $(MODULE_BINARY)
 endif
-	tar --exclude='.DS_Store' -czf $@ meta.json first_run.sh $(MODULE_BINARY) setup-app/build/ assets/
+	tar --exclude='.DS_Store' -czf $@ meta.json $(MODULE_BINARY) setup-app/build/ assets/
 ifeq ($(VIAM_TARGET_OS), windows)
 	git checkout meta.json
 endif

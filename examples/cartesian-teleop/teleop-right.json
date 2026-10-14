@@ -1,0 +1,35 @@
+{
+  "leader_arm": "right-leader-arm",
+  "leader_gripper": "right-leader-gripper",
+  "follower_component": "right-gripper",
+  "follower_gripper": "right-gripper",
+  "motion_service": "builtin",
+  "scale": 2.5,
+  "origin_translation_mm": {
+    "x": 0,
+    "y": 0,
+    "z": 0
+  },
+  "origin_orientation": {
+    "type": "ov_degrees",
+    "value": {
+      "x": 0,
+      "y": 0,
+      "z": 1,
+      "th": 0
+    }
+  },
+  "rotation_enabled": true,
+  "align_on_start": true,
+  "leader_hold": "manual",
+  "rate_hz": 60,
+  "smooth_tau_ms": 100,
+  "pos_deadzone_mm": 1,
+  "rot_deadzone_deg": 1,
+  "follower_gripper_mode": "xarm",
+  "gripper_invert": false,
+  "gripper_deadband_pct": 3,
+  "gripper_range": 850,
+  "gripper_in_min_pct": 0,
+  "gripper_in_max_pct": 70
+}

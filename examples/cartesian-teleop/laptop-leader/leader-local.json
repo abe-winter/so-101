@@ -1,0 +1,138 @@
+{
+  "network": {
+    "bind_address": "localhost:8080"
+  },
+  "modules": [
+    {
+      "type": "local",
+      "name": "so101-local",
+      "executable_path": "/Users/clint.purser/Documents/modules/so-101/bin/arm"
+    }
+  ],
+  "components": [
+    {
+      "name": "left-leader-arm",
+      "api": "rdk:component:arm",
+      "model": "devrel:so101:arm",
+      "attributes": {
+        "port": "/dev/cu.usbmodem5C4C1239101",
+        "speed_degs_per_sec": 60,
+        "calibration_file": "left_leader_calibration.json"
+      },
+      "frame": {
+        "parent": "world",
+        "translation": {
+          "x": 0,
+          "y": 0,
+          "z": 0
+        },
+        "orientation": {
+          "type": "ov_degrees",
+          "value": {
+            "x": 0,
+            "y": 0,
+            "z": 1,
+            "th": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "left-leader-gripper",
+      "api": "rdk:component:gripper",
+      "model": "devrel:so101:gripper",
+      "attributes": {
+        "arm": "left-leader-arm",
+        "gripper_type": "leader"
+      },
+      "frame": {
+        "parent": "left-leader-arm",
+        "translation": {
+          "x": 0,
+          "y": 0,
+          "z": 0
+        },
+        "orientation": {
+          "type": "ov_degrees",
+          "value": {
+            "x": 0,
+            "y": 0,
+            "z": 1,
+            "th": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "right-leader-arm",
+      "api": "rdk:component:arm",
+      "model": "devrel:so101:arm",
+      "attributes": {
+        "port": "/dev/cu.usbmodem5C821109531",
+        "speed_degs_per_sec": 60,
+        "calibration_file": "right_leader_calibration.json"
+      },
+      "frame": {
+        "parent": "world",
+        "translation": {
+          "x": 0,
+          "y": 0,
+          "z": 0
+        },
+        "orientation": {
+          "type": "ov_degrees",
+          "value": {
+            "x": 0,
+            "y": 0,
+            "z": 1,
+            "th": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "right-leader-gripper",
+      "api": "rdk:component:gripper",
+      "model": "devrel:so101:gripper",
+      "attributes": {
+        "arm": "right-leader-arm",
+        "gripper_type": "leader"
+      },
+      "frame": {
+        "parent": "right-leader-arm",
+        "translation": {
+          "x": 0,
+          "y": 0,
+          "z": 0
+        },
+        "orientation": {
+          "type": "ov_degrees",
+          "value": {
+            "x": 0,
+            "y": 0,
+            "z": 1,
+            "th": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "left-calibration",
+      "api": "rdk:component:sensor",
+      "model": "devrel:so101:calibration",
+      "attributes": {
+        "port": "/dev/cu.usbmodem5C4C1239101",
+        "calibration_file": "left_leader_calibration.json"
+      }
+    },
+    {
+      "name": "right-calibration",
+      "api": "rdk:component:sensor",
+      "model": "devrel:so101:calibration",
+      "attributes": {
+        "port": "/dev/cu.usbmodem5C821109531",
+        "calibration_file": "right_leader_calibration.json"
+      }
+    }
+  ]
+}

@@ -13,6 +13,7 @@ import (
 	so101calibration "so_arm/components/calibration"
 	so101gripper "so_arm/components/gripper"
 	so101simulated "so_arm/components/simulated"
+	so101cartesian "so_arm/services/cartesianteleop"
 	so101discovery "so_arm/services/discovery"
 	so101teleop "so_arm/services/teleop"
 )
@@ -27,5 +28,6 @@ func main() {
 		resource.APIModel{API: sensor.API, Model: so101calibration.SO101CalibrationSensorModel},
 		resource.APIModel{API: rdkdiscovery.API, Model: so101discovery.SO101DiscoveryModel},
 		resource.APIModel{API: generic.API, Model: so101teleop.SO101TeleopModel},
+		resource.APIModel{API: generic.API, Model: so101cartesian.Model},
 	)
 }
