@@ -107,7 +107,9 @@ type Alignment struct {
 	FollowerPose        spatialmath.Pose
 	LeaderTarget        spatialmath.Pose // Mapping.Inverse(FollowerPose)
 	LeaderInputs        []referenceframe.Input
-	PositionErrorMM     float64 // gap between the mapped leader pose and the follower, after Start
+	LeaderActual        spatialmath.Pose // the leader's EndPosition after Start's move/capture
+	Mapped              spatialmath.Pose // Mapping.Forward(LeaderActual), before the residual
+	PositionErrorMM     float64          // gap between the mapped leader pose and the follower, after Start
 	OrientationErrorDeg float64
 	Residual            Residual
 }
@@ -145,6 +147,11 @@ type Engine struct {
 	align       *Alignment
 	startOri    spatialmath.Orientation
 	filter      *Filter
+
+	// Debug pose logging (poselog.go): when the run loop last logged its pose line, and the
+	// last target handed to the pipeline.
+	poseLogAt    atomic.Int64
+	lastSentPose atomic.Pointer[spatialmath.Pose]
 
 	cycles, sends, dropped uint64
 	consecutiveErrors      int
@@ -285,10 +292,13 @@ func (e *Engine) captureLeader(ctx context.Context) (*Alignment, error) {
 		FollowerPose:        followerPose,
 		LeaderTarget:        e.cfg.Mapping.Inverse(followerPose),
 		LeaderInputs:        joints,
+		LeaderActual:        actual,
+		Mapped:              mapped,
 		PositionErrorMM:     followerPose.Point().Sub(mapped.Point()).Norm(),
 		OrientationErrorDeg: orientationError(mapped.Orientation(), followerPose.Orientation()).Norm() * 180 / math.Pi,
 		Residual:            ResidualBetween(mapped, followerPose),
 	}
+	e.logAlign(al)
 	return al, nil
 }
 
@@ -377,6 +387,7 @@ func (e *Engine) alignLeader(ctx context.Context) (*Alignment, error) {
 		return nil, fmt.Errorf("read leader pose after align: %w", err)
 	}
 	mapped := e.cfg.Mapping.Forward(actual)
+	al.LeaderActual, al.Mapped = actual, mapped
 	al.PositionErrorMM = followerPose.Point().Sub(mapped.Point()).Norm()
 	al.OrientationErrorDeg = orientationError(mapped.Orientation(), followerPose.Orientation()).Norm() * 180 / math.Pi
 	if e.cfg.AlignMaxPositionErrorMM > 0 && al.PositionErrorMM > e.cfg.AlignMaxPositionErrorMM {
@@ -393,6 +404,7 @@ func (e *Engine) alignLeader(ctx context.Context) (*Alignment, error) {
 	if e.cfg.CompensateResidual {
 		al.Residual = ResidualBetween(mapped, followerPose)
 	}
+	e.logAlign(al)
 	return al, nil
 }
 
@@ -566,6 +578,7 @@ func (e *Engine) syncOnce(ctx context.Context) error {
 		return fmt.Errorf("read leader pose: %w", err)
 	}
 	target := e.MapTarget(pose)
+	e.maybeLogPose(pose, target)
 
 	e.mu.Lock()
 	filter := e.filter
@@ -604,6 +617,7 @@ func (e *Engine) MapTarget(leader spatialmath.Pose) spatialmath.Pose {
 
 func (e *Engine) sendMove(target spatialmath.Pose) {
 	defer e.inFlight.Store(false)
+	e.lastSentPose.Store(&target)
 	ctx, cancel := context.WithTimeout(context.Background(), e.cfg.MoveTimeout)
 	defer cancel()
 	start := time.Now()

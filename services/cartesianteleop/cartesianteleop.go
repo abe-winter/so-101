@@ -162,6 +162,7 @@ func (s *service) statusMap() map[string]interface{} {
 	}
 	if al := s.engine.Align(); al != nil {
 		out["align_leader_joints"] = al.LeaderInputs
+		out["align_poses"] = al.PosesMap()
 	}
 	return out
 }
