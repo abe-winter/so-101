@@ -15,9 +15,10 @@ func ov(x, y, z, thDeg float64) spatialmath.Orientation {
 
 func TestMappingRoundTrips(t *testing.T) {
 	m := Mapping{
-		Origin:       spatialmath.NewPose(r3.Vector{X: 500, Y: -200, Z: 30}, ov(0, 0, 1, -90)),
-		Scale:        2.5,
-		ToolRotation: ov(0, 1, 0, 0),
+		Origin:           spatialmath.NewPose(r3.Vector{X: 500, Y: -200, Z: 30}, ov(0, 0, 1, -90)),
+		Scale:            2.5,
+		LeaderToolOffset: r3.Vector{X: 3, Y: -2, Z: 96},
+		ToolRotation:     ov(0, 1, 0, 0),
 	}
 	leader := spatialmath.NewPose(r3.Vector{X: 120, Y: 40, Z: 210}, ov(0.3, 0.1, 0.9, 25))
 	back := m.Inverse(m.Forward(leader))
@@ -30,6 +31,31 @@ func TestMappingScalesTranslationAboutTheLeaderBase(t *testing.T) {
 	fwd := m.Forward(spatialmath.NewPose(r3.Vector{X: 100, Y: 0, Z: 50}, spatialmath.NewZeroOrientation()))
 	test.That(t, fwd.Point().X, test.ShouldAlmostEqual, 300)
 	test.That(t, fwd.Point().Z, test.ShouldAlmostEqual, 150)
+}
+
+// TestLeaderToolOffsetMovesTheMirroredPointToTheTip pins the reason the offset exists: a leader
+// whose handle tip rests on the table (tool frame 96 mm up, pointing down) must map to a follower
+// tip ON the table, not scale*96 mm above it, and the offset must be scaled with the rest of the
+// translation so that holds at every scale.
+func TestLeaderToolOffsetMovesTheMirroredPointToTheTip(t *testing.T) {
+	m := Mapping{Scale: 2.5, LeaderToolOffset: r3.Vector{Z: 96}}
+	// Tool frame 96 mm above the table, approach axis pointing straight down (-Z).
+	leader := spatialmath.NewPose(r3.Vector{X: 200, Y: 0, Z: 96}, ov(0, 0, -1, 0))
+	fwd := m.Forward(leader)
+	test.That(t, fwd.Point().Z, test.ShouldAlmostEqual, 0, 1e-9)
+	test.That(t, fwd.Point().X, test.ShouldAlmostEqual, 500, 1e-9)
+	test.That(t, spatialmath.OrientationAlmostEqual(fwd.Orientation(), leader.Orientation()), test.ShouldBeTrue)
+
+	// Pivoting the leader about its tip (tool frame rotates to point +X, tip stays put at
+	// (200,0,0)) must leave the follower tip where it was: the whole point of mirroring the tip.
+	pivoted := spatialmath.NewPose(r3.Vector{X: 200 - 96, Y: 0, Z: 0}, ov(1, 0, 0, 0))
+	got := m.Forward(pivoted)
+	test.That(t, got.Point().Sub(fwd.Point()).Norm(), test.ShouldBeLessThan, 1e-9)
+
+	// Without the offset the same pivot moves the follower by scale * 96 * sqrt(2).
+	bare := Mapping{Scale: 2.5}
+	drift := bare.Forward(pivoted).Point().Sub(bare.Forward(leader).Point()).Norm()
+	test.That(t, drift, test.ShouldAlmostEqual, 2.5*96*math.Sqrt2, 1e-6)
 }
 
 func TestMappingZeroValueIsIdentity(t *testing.T) {

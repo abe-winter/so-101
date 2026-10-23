@@ -18,19 +18,25 @@ import (
 // Mapping relates the leader's end-effector pose, in the leader's base frame as EndPosition
 // reports it, to the follower's target pose in the follower machine's world frame:
 //
-//	follower = Origin ∘ scale(leader) ∘ ToolRotation
+//	follower = Origin ∘ scale(leader ∘ LeaderToolOffset) ∘ ToolRotation
 //
-// Origin places the leader's base in the follower's world. Scale multiplies the leader's
-// translation about its own base origin, so a small desktop leader can span a large follower
-// workspace. ToolRotation is a constant rotation applied in the tool frame that aligns the two
-// arms' tool-frame conventions (which axis is "approach", which is "up").
+// Origin places the leader's base in the follower's world. LeaderToolOffset moves the point
+// being mirrored from the leader's reported end-effector frame out to its physical tip, in the
+// tool frame, BEFORE scaling: EndPosition on an SO-101 is the wrist "tool" frame, ~96 mm behind
+// the far end of the leader handle, while the follower is normally driven at its jaw tip. Without
+// the offset a leader rotation pivots the follower about a point scale*96 mm off its tip, so a
+// handle tip held on the table maps to a follower tip hovering above it. Scale multiplies the
+// leader's (offset) translation about its own base origin, so a small desktop leader can span a
+// large follower workspace. ToolRotation is a constant rotation applied in the tool frame that
+// aligns the two arms' tool-frame conventions (which axis is "approach", which is "up").
 //
 // There is deliberately no clutch and no per-session reference: the mapping is absolute, which
 // is what lets Engine.Start drive the leader to the follower's pose (Inverse) before mirroring.
 type Mapping struct {
-	Origin       spatialmath.Pose
-	Scale        float64
-	ToolRotation spatialmath.Orientation
+	Origin           spatialmath.Pose
+	Scale            float64
+	LeaderToolOffset r3.Vector
+	ToolRotation     spatialmath.Orientation
 }
 
 func (m Mapping) origin() spatialmath.Pose {
@@ -54,9 +60,14 @@ func (m Mapping) toolRotation() spatialmath.Pose {
 	return spatialmath.NewPoseFromOrientation(m.ToolRotation)
 }
 
+func (m Mapping) leaderToolOffset() spatialmath.Pose {
+	return spatialmath.NewPoseFromPoint(m.LeaderToolOffset)
+}
+
 // Forward maps a leader end-effector pose to the follower target it corresponds to.
 func (m Mapping) Forward(leader spatialmath.Pose) spatialmath.Pose {
-	scaled := spatialmath.NewPose(leader.Point().Mul(m.scale()), leader.Orientation())
+	tip := spatialmath.Compose(leader, m.leaderToolOffset())
+	scaled := spatialmath.NewPose(tip.Point().Mul(m.scale()), tip.Orientation())
 	return spatialmath.Compose(spatialmath.Compose(m.origin(), scaled), m.toolRotation())
 }
 
@@ -64,10 +75,11 @@ func (m Mapping) Forward(leader spatialmath.Pose) spatialmath.Pose {
 // there. The result is a kinematic *request*: a 5-DoF leader usually cannot reach it exactly,
 // which is what SolveBestEffort is for.
 func (m Mapping) Inverse(follower spatialmath.Pose) spatialmath.Pose {
-	// follower = O ∘ S(l) ∘ T   =>   S(l) = O⁻¹ ∘ follower ∘ T⁻¹
+	// follower = O ∘ S(l ∘ D) ∘ T   =>   l = S⁻¹(O⁻¹ ∘ follower ∘ T⁻¹) ∘ D⁻¹
 	p := spatialmath.Compose(spatialmath.PoseInverse(m.origin()), follower)
 	p = spatialmath.Compose(p, spatialmath.PoseInverse(m.toolRotation()))
-	return spatialmath.NewPose(p.Point().Mul(1/m.scale()), p.Orientation())
+	tip := spatialmath.NewPose(p.Point().Mul(1/m.scale()), p.Orientation())
+	return spatialmath.Compose(tip, spatialmath.PoseInverse(m.leaderToolOffset()))
 }
 
 // Residual is the constant correction that makes the mapped leader pose coincide with the

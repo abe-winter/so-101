@@ -61,6 +61,7 @@ type Settings struct {
 	Scale             float64                        `json:"scale,omitempty"`                 // default 1
 	OriginTranslation *Vec3                          `json:"origin_translation_mm,omitempty"` // leader base in follower world
 	OriginOrientation *spatialmath.OrientationConfig `json:"origin_orientation,omitempty"`
+	LeaderToolOffset  *Vec3                          `json:"leader_tool_offset_mm,omitempty"` // leader tip in its EndPosition frame, applied before scale
 	ToolOrientation   *spatialmath.OrientationConfig `json:"tool_orientation,omitempty"`
 	RotationEnabled   *bool                          `json:"rotation_enabled,omitempty"` // default true
 
@@ -89,6 +90,19 @@ type Settings struct {
 	GripperDeadbandPct  float64     `json:"gripper_deadband_pct,omitempty"` // default 3
 	GripperInMinPct     float64     `json:"gripper_in_min_pct,omitempty"`   // leader raw reading that maps to 0 (default 0)
 	GripperInMaxPct     float64     `json:"gripper_in_max_pct,omitempty"`   // leader raw reading that maps to 100 (default 100)
+	// GripperLock freezes the whole pair while the follower gripper moves: no pose targets go
+	// to the follower and the leader is held stiff (manual_hold), for GripperLockMs after each
+	// gripper command. For followers whose controller pauses arm motion during a gripper move
+	// (the Fairino FR5), so the leader cannot run ahead of a follower that is not moving.
+	GripperLock   bool    `json:"gripper_lock,omitempty"`
+	GripperLockMs float64 `json:"gripper_lock_ms,omitempty"` // default 1500, max 4500
+
+	// Blocked-follower feedback. See FeedbackConfig.
+	BlockedFeedback           string  `json:"blocked_feedback,omitempty"`               // "spring" or "off" (default)
+	FeedbackTorqueLimit       int     `json:"feedback_torque_limit,omitempty"`          // default 250
+	FeedbackMaxSpeedDegPerSec float64 `json:"feedback_max_speed_deg_per_sec,omitempty"` // default 45
+	FeedbackLagMM             float64 `json:"feedback_lag_mm,omitempty"`                // default 40
+	FollowerArm               string  `json:"follower_arm,omitempty"`                   // lets planner errors naming the arm be attributed
 }
 
 // Validate checks the settings. It does not check that resources exist.
@@ -121,6 +135,25 @@ func (s Settings) Validate() error {
 	}
 	if s.GripperInMaxPct != 0 && s.GripperInMaxPct <= s.GripperInMinPct {
 		return fmt.Errorf("gripper_in_max_pct (%v) must be greater than gripper_in_min_pct (%v)", s.GripperInMaxPct, s.GripperInMinPct)
+	}
+	if s.GripperLockMs < 0 || s.GripperLockMs > 4500 {
+		return fmt.Errorf("gripper_lock_ms must be in [0, 4500], got %v", s.GripperLockMs)
+	}
+	switch s.BlockedFeedback {
+	case "", "off":
+	case "spring":
+		if s.LeaderHold != "" && s.LeaderHold != HoldManual {
+			return fmt.Errorf("blocked_feedback %q needs leader_hold %q (the pull-back lives in the leader's manual mode), got %q",
+				s.BlockedFeedback, HoldManual, s.LeaderHold)
+		}
+	default:
+		return fmt.Errorf("blocked_feedback must be \"spring\" or \"off\", got %q", s.BlockedFeedback)
+	}
+	if s.FeedbackTorqueLimit < 0 || s.FeedbackTorqueLimit > 1000 {
+		return fmt.Errorf("feedback_torque_limit must be in [0,1000], got %d", s.FeedbackTorqueLimit)
+	}
+	if s.FeedbackMaxSpeedDegPerSec < 0 || s.FeedbackMaxSpeedDegPerSec > 180 {
+		return fmt.Errorf("feedback_max_speed_deg_per_sec must be in [0,180], got %v", s.FeedbackMaxSpeedDegPerSec)
 	}
 	if (s.LeaderGripper == "") != (s.FollowerGripper == "") {
 		return fmt.Errorf("leader_gripper and follower_gripper must be set together")
@@ -165,6 +198,9 @@ func (s Settings) Resolve() (Config, error) {
 		originPt = r3.Vector{X: s.OriginTranslation.X, Y: s.OriginTranslation.Y, Z: s.OriginTranslation.Z}
 	}
 	m.Origin = spatialmath.NewPose(originPt, originOri)
+	if s.LeaderToolOffset != nil {
+		m.LeaderToolOffset = r3.Vector{X: s.LeaderToolOffset.X, Y: s.LeaderToolOffset.Y, Z: s.LeaderToolOffset.Z}
+	}
 	if s.ToolOrientation != nil {
 		o, err := s.ToolOrientation.ParseConfig()
 		if err != nil {
@@ -196,8 +232,19 @@ func (s Settings) Resolve() (Config, error) {
 		GripperDeadbandPct:      pick(s.GripperDeadbandPct, 3),
 		GripperInMinPct:         s.GripperInMinPct,
 		GripperInMaxPct:         pick(s.GripperInMaxPct, 100),
+		GripperLockTorqueLimit:  int(pick(float64(s.FeedbackTorqueLimit), 250)),
 		MoveTimeout:             time.Duration(pick(s.MoveTimeoutMs, 500) * float64(time.Millisecond)),
 		MaxConsecutiveErrors:    s.MaxConsecutiveErr,
+		Feedback: FeedbackConfig{
+			Enabled:           s.BlockedFeedback == "spring",
+			TorqueLimit:       s.FeedbackTorqueLimit,
+			MaxSpeedDegPerSec: s.FeedbackMaxSpeedDegPerSec,
+			LagMM:             s.FeedbackLagMM,
+			FollowerArm:       s.FollowerArm,
+		},
+	}
+	if s.GripperLock {
+		cfg.GripperLock = time.Duration(pick(s.GripperLockMs, 1500) * float64(time.Millisecond))
 	}
 	if s.SmoothTauMs != nil {
 		cfg.Filter.SmoothTau = time.Duration(*s.SmoothTauMs * float64(time.Millisecond))

@@ -33,6 +33,10 @@ type fakeLeader struct {
 	// limp makes MoveToJointPositions accept the goal and return nil without changing the
 	// joints, which is what a torque-off or overload-tripped servo bus does.
 	limp bool
+	// failCommand, if set, makes DoCommand fail for that one command name, like a hold
+	// the arm cannot enter (a servo refusing its gain read on entering manual mode).
+	failCommand    string
+	failCommandErr error
 }
 
 func newFakeLeader(t *testing.T, joints []referenceframe.Input) *fakeLeader {
@@ -76,6 +80,9 @@ func (f *fakeLeader) DoCommand(_ context.Context, cmd map[string]interface{}) (m
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.commands = append(f.commands, cmd)
+	if f.failCommand != "" && cmd["command"] == f.failCommand {
+		return nil, f.failCommandErr
+	}
 	return map[string]interface{}{}, nil
 }
 
@@ -104,10 +111,20 @@ type fakeMotion struct {
 	stops    int
 	moveErr  error
 	moveWait chan struct{} // if set, Move blocks until closed
+	// statusErr is what teleop_status reports as the pipeline's error.
+	statusErr string
 }
 
 func (m *fakeMotion) GetPose(_ context.Context, name, dst string, _ []*referenceframe.LinkInFrame, _ map[string]interface{}) (*referenceframe.PoseInFrame, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return referenceframe.NewPoseInFrame(dst, m.pose), nil
+}
+
+func (m *fakeMotion) setStatusError(e string) {
+	m.mu.Lock()
+	m.statusErr = e
+	m.mu.Unlock()
 }
 
 func (m *fakeMotion) DoCommand(_ context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
@@ -147,7 +164,13 @@ func (m *fakeMotion) DoCommand(_ context.Context, cmd map[string]interface{}) (m
 		return map[string]interface{}{"teleop_stop": true}, nil
 	}
 	if _, ok := cmd["teleop_status"]; ok {
-		return map[string]interface{}{"teleop_status": map[string]interface{}{"running": true}}, nil
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		st := map[string]interface{}{"running": true}
+		if m.statusErr != "" {
+			st["error"] = m.statusErr
+		}
+		return map[string]interface{}{"teleop_status": st}, nil
 	}
 	return nil, errors.New("unknown command")
 }
@@ -531,6 +554,7 @@ func TestSettingsResolveDefaultsAndParsesOrientations(t *testing.T) {
 		"scale": 2.5,
 		"origin_translation_mm": {"x": 100, "y": 0, "z": 50},
 		"origin_orientation": {"type": "ov_degrees", "value": {"x": 0, "y": 0, "z": 1, "th": -90}},
+		"leader_tool_offset_mm": {"z": 96},
 		"tool_orientation": {"type": "ov_degrees", "value": {"x": 0, "y": 1, "z": 0, "th": 0}},
 		"smooth_tau_ms": 0,
 		"leader_hold": "stiff"
@@ -541,6 +565,7 @@ func TestSettingsResolveDefaultsAndParsesOrientations(t *testing.T) {
 	test.That(t, cfg.RateHz, test.ShouldEqual, 60)
 	test.That(t, cfg.Mapping.Scale, test.ShouldEqual, 2.5)
 	test.That(t, cfg.Mapping.Origin.Point().X, test.ShouldEqual, 100)
+	test.That(t, cfg.Mapping.LeaderToolOffset.Z, test.ShouldEqual, 96)
 	test.That(t, cfg.Mapping.ToolRotation, test.ShouldNotBeNil)
 	test.That(t, cfg.Filter.SmoothTau, test.ShouldEqual, 0) // explicit 0 disables
 	test.That(t, cfg.Filter.DeadzonePosMM, test.ShouldEqual, 1)
@@ -582,6 +607,27 @@ func TestStartRefusesWhenTheLeaderAcceptsTheMoveButDoesNotMove(t *testing.T) {
 	test.That(t, len(leader.moves), test.ShouldEqual, 1)                                   // the move was attempted
 	test.That(t, leader.commandNames(), test.ShouldResemble, []string{"exit_manual_mode"}) // but no hold applied
 	test.That(t, len(motion.starts), test.ShouldEqual, 0)                                  // and the pipeline untouched
+	test.That(t, e.Status().Running, test.ShouldBeFalse)
+}
+
+func TestAlignReleasesTheLeaderWhenTheHoldCannotBeApplied(t *testing.T) {
+	m := Mapping{}
+	leader := newFakeLeader(t, []referenceframe.Input{0, 0, 0, 0, 0})
+	// Seen on hardware: the align move succeeds, then enter_manual_mode fails on a servo
+	// whose gain read reports overload. The leader must not be stranded in whatever state
+	// the half-applied hold left it, and the caller must get the reason.
+	leader.failCommand = "enter_manual_mode"
+	leader.failCommandErr = errors.New("read p_gain servo 4: servo status error: [overload]")
+	motion := &fakeMotion{pose: followerPoseReachableBy(t, leader, m, []referenceframe.Input{0.3, -0.5, 0.8, 0.2, 0})}
+	e := newTestEngine(t, leader, motion, Config{Mapping: m, LeaderHold: HoldManual, RotationEnabled: true})
+
+	err := e.Start(context.Background())
+	test.That(t, err, test.ShouldNotBeNil)
+	test.That(t, err.Error(), test.ShouldContainSubstring, "enter leader manual mode")
+	test.That(t, err.Error(), test.ShouldContainSubstring, "overload")
+	test.That(t, len(leader.moves), test.ShouldEqual, 1) // the align move happened
+	test.That(t, leader.commandNames(), test.ShouldResemble, []string{"exit_manual_mode", "enter_manual_mode", "exit_manual_mode"})
+	test.That(t, len(motion.starts), test.ShouldEqual, 0) // the pipeline never saw the follower
 	test.That(t, e.Status().Running, test.ShouldBeFalse)
 }
 

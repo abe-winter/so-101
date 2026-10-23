@@ -55,12 +55,21 @@ so the arm does not snap).
 ## The mapping
 
 ```
-follower_pose = origin ∘ scale(leader_pose) ∘ tool_orientation
+follower_pose = origin ∘ scale(leader_pose ∘ leader_tool_offset) ∘ tool_orientation
 ```
 
 - `leader_pose` is the leader arm's `EndPosition`, in its own base frame.
-- `scale` multiplies the leader's translation about its base, so a desktop arm can span a
-  large follower workspace.
+- `leader_tool_offset_mm` moves the mirrored point from the leader's `EndPosition` frame out
+  to its physical tip, in the tool frame, **before** scaling. On an SO-101 `EndPosition` is
+  the wrist `tool` frame, about 96 mm behind the far end of the leader handle, while
+  `follower_component` is normally a gripper frame at the jaw tip. Without the offset the two
+  arms are mirrored at different points along the tool axis: translations still match, but a
+  leader rotation pivots the follower about a point `scale × 96 mm` off its tip, so a handle
+  tip held on the table maps to a follower tip hovering `scale × 96 mm` above it. With it, tip
+  maps to tip at every scale. Measured from the leader gripper meshes; `{"z": 96}` for the
+  stock SO-101 leader handle.
+- `scale` multiplies the leader's (offset) translation about its base, so a desktop arm can
+  span a large follower workspace.
 - `origin_translation_mm` / `origin_orientation` place the leader's base in the follower's
   world frame.
 - `tool_orientation` is a fixed rotation in the tool frame that reconciles the two arms'
@@ -80,6 +89,7 @@ only, which many drivers prefer.
   "follower_component": "xarm-gripper",
   "follower_gripper": "xarm-gripper",
   "scale": 2.0,
+  "leader_tool_offset_mm": { "x": 0, "y": 0, "z": 96 },
   "origin_translation_mm": { "x": 0, "y": 0, "z": 0 },
   "origin_orientation": { "type": "ov_degrees", "value": { "x": 0, "y": 0, "z": 1, "th": 0 } },
   "rotation_enabled": true,
@@ -89,6 +99,42 @@ only, which many drivers prefer.
 
 The follower arm, its gripper and the motion service must all be in this viam-server's
 frame system: either on the same machine, or on a machine configured as a remote.
+
+### Several leader/follower pairs in one service
+
+One service drives every pair on a machine, like the vive module's `hands` list. Top-level
+attributes become defaults shared by every pair; each entry of `pairs` has a `name` and
+overrides whatever it needs, normally just the arm names and the origin. A key set in a pair
+wins; a key it omits is inherited. Without `pairs`, the top-level attributes are the one pair,
+named `main`.
+
+```json
+{
+  "scale": 2.5,
+  "leader_tool_offset_mm": { "x": 0, "y": 0, "z": 96 },
+  "align_on_start": true,
+  "leader_hold": "manual",
+  "gripper_in_max_pct": 70,
+  "pairs": [
+    {
+      "name": "left",
+      "leader_arm": "left-leader-arm", "leader_gripper": "left-leader-gripper",
+      "follower_component": "left-gripper", "follower_gripper": "left-gripper",
+      "origin_translation_mm": { "x": 0, "y": 1003, "z": 0 }
+    },
+    {
+      "name": "right",
+      "leader_arm": "right-leader-arm", "leader_gripper": "right-leader-gripper",
+      "follower_component": "right-gripper", "follower_gripper": "right-gripper"
+    }
+  ]
+}
+```
+
+Every pair registers with the same motion service teleop pipeline, which plans all registered
+followers in **one joint plan**. So a target the planner rejects on one side (a collision with
+the table, a wall, or the other arm) stalls the other side too. That is a property of the
+pipeline, and running the pairs as separate services does not change it.
 
 ### Attributes
 
@@ -101,6 +147,7 @@ frame system: either on the same machine, or on a machine configured as a remote
 | `scale` | number | Optional | Translation scale, leader → follower. Default `1`. |
 | `origin_translation_mm` | `{x,y,z}` | Optional | Leader base position in follower world. Default origin. |
 | `origin_orientation` | orientation | Optional | Leader base orientation in follower world (frame-config syntax, e.g. `ov_degrees`). Default identity. |
+| `leader_tool_offset_mm` | `{x,y,z}` | Optional | Leader tip in its `EndPosition` (tool) frame, applied before `scale`. Default zero (mirror the reported frame itself). Use `{"z": 96}` for the stock SO-101 leader handle. |
 | `tool_orientation` | orientation | Optional | Fixed tool-frame rotation. Default identity. |
 | `rotation_enabled` | bool | Optional | Mirror orientation as well as position. Default `true`. |
 | `rate_hz` | number | Optional | Leader sampling rate. Default `60`. Sends are at most one in flight ("latest wins"), so the send rate is bounded by the RPC round trip. |
@@ -119,8 +166,15 @@ frame system: either on the same machine, or on a machine configured as a remote
 | `gripper_invert` | bool | Optional | Flip the leader percentage. The SO-101 gripper reports `0` closed / `~95` open, and the leader handle's trigger reads near `0` at rest, so without inversion the follower sits closed and squeezing opens it. Set `true` for squeeze-to-close. |
 | `gripper_range` | number | Optional | Steps at 100 % in `xarm` mode. Default `850`. |
 | `gripper_in_min_pct` / `gripper_in_max_pct` | number | Optional | Rescale the leader's raw reading before inversion: values at or below `min` map to 0 %, at or above `max` to 100 %. Default `0` / `100`. Lowering `max` (the examples use 70) makes full opening need less trigger travel. |
+| `gripper_lock` / `gripper_lock_ms` | bool / number | Optional | Freeze the pair while its follower gripper moves: after every follower-gripper command, no pose targets go to the follower and the leader is held where it is (`manual_hold` at `feedback_torque_limit`, default 250; needs `leader_hold: manual` to hold the leader) for `gripper_lock_ms` (default `1500`, max `4500`), extended by each further gripper command. For followers whose controller pauses arm motion during a gripper move, such as the Fairino FR5, so the leader cannot run ahead of a follower that is standing still. Default off. |
 | `gripper_deadband_pct` | number | Optional | Leader change needed before a new gripper command. Default `3`. Gripper writes are asynchronous and latest-wins, because the xArm gripper's `set` blocks until the jaw arrives. |
-| `auto_start` | bool | Optional | Start on configure. Default `false`. |
+| `blocked_feedback` | string | Optional | `spring` pulls the leader back when its follower cannot follow (see [Blocked-follower feedback](#blocked-follower-feedback)); `off` (default) does not. Needs `leader_hold: manual`. |
+| `feedback_torque_limit` | int | Optional | Leader torque cap (0-1000) while it pulls back. Default `250`; manual mode's own cap is `50`. |
+| `feedback_max_speed_deg_per_sec` | number | Optional | How fast the leader is pulled back. Default `45`. |
+| `feedback_lag_mm` | number | Optional | How far the follower must sit from its target, without moving, to count as stalled. Default `40`. |
+| `follower_arm` | string | Optional | The follower ARM's component name. Lets a planner error that names the arm's own geometry (not just the gripper's) be attributed to this pair at once. |
+| `pairs` | list | Optional | Leader/follower pairs, each a `name` plus any of the attributes above, overlaid on the top-level defaults. See [Several pairs](#several-leaderfollower-pairs-in-one-service). Default: the top-level attributes are one pair named `main`. |
+| `auto_start` | bool | Optional | Start every pair on configure. Default `false`. |
 
 ### `leader_hold`
 
@@ -130,15 +184,48 @@ frame system: either on the same machine, or on a machine configured as a remote
 | `stiff` | Full stiffness; the driver cannot move it. | Checking alignment without a hand on the arm. |
 | `torque_off` | Servos unpowered. The arm **falls** unless held, and the fall is mirrored. | Only with a hand already on the leader. |
 
+## Blocked-follower feedback
+
+With `"blocked_feedback": "spring"`, when a pair's follower cannot follow its leader, the
+leader pushes back toward the last pose the follower actually reached. It is the leader-arm
+counterpart of the vive controller's and the phone's haptic pulse. The follower is judged
+blocked when either:
+
+- the motion pipeline's planner error names this pair's follower (`follower_component`, or
+  `follower_arm` when set): a collision with the table, a wall, or the other arm; or
+- the follower has sat more than `feedback_lag_mm` from its target, without moving, for
+  300 ms. This catches goals the planner calls unreachable (which name no component, so
+  cannot be attributed by name) and anything else that stops the follower short.
+
+The pull-back target is the recorded leader pose whose mapped target lay nearest the
+follower's actual position, not simply the most recent one: a failed plan takes up to a
+second to report, and by then the latest leader poses are already deep in the unreachable
+region. The leader is driven there at no more than `feedback_max_speed_deg_per_sec` with its
+torque cap raised to `feedback_torque_limit`, so it pushes back firmly without snapping into
+the hand. The pull is refreshed every 100 ms and expires on its own within 300 ms if
+nothing refreshes it. When the follower is following again, the leader is released, and
+its goals re-anchor where the hand has it.
+
+Because the pull eases the leader back to where the follower is, the pipeline gets a target
+it can reach, its error clears, and the leader lets go. Pushing through the pull simply keeps
+it on. `status` reports `blocked` and `blocked_reason` per pair.
+
 ## DoCommand
 
 ```json
 { "command": "start" }
 { "command": "stop" }
 { "command": "status" }
+{ "command": "start", "side": "left" }
 ```
 
-`status` returns `running`, `cycles`, `sends`, `dropped` (a send was due while one was in
+Each command acts on every pair, or on one pair when given `"side": "<pair name>"`. `start`
+attempts every pair even if one fails (an align the leader cannot reach, say), and returns the
+failure as an error; `status` then shows which pairs are running. `stop` likewise releases
+every leader it can.
+
+Every command returns `{"running": <any pair running>, "pairs": {"<name>": {...}}}`. Each
+pair reports `running`, `cycles`, `sends`, `dropped` (a send was due while one was in
 flight), `deadzoned`, `rejected`, `consecutive_errors`, `last_error`, `last_rpc_ms`,
 `rate_hz`, `align_position_error_mm`, `align_orientation_error_deg`, `align_leader_joints`
 and `gripper_pct`.

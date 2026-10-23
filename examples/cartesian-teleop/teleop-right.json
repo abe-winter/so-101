@@ -5,6 +5,11 @@
   "follower_gripper": "right-gripper",
   "motion_service": "builtin",
   "scale": 2.5,
+  "leader_tool_offset_mm": {
+    "x": 0,
+    "y": 0,
+    "z": 96
+  },
   "origin_translation_mm": {
     "x": 0,
     "y": 0,

@@ -11,6 +11,8 @@ import (
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/spatialmath"
+
+	"so_arm/internal/geometry"
 )
 
 // Leader is the slice of arm.Arm the engine reads and aligns. arm.Arm satisfies it, in
@@ -59,9 +61,19 @@ type Config struct {
 	// with less trigger travel. Defaults 0 and 100 (no rescale).
 	GripperInMinPct float64
 	GripperInMaxPct float64
+	// GripperLock, when non-zero, freezes the pair for this long after every follower-gripper
+	// command: pose sends stop and the leader is held where it is (manual_hold, only with
+	// LeaderHold == HoldManual), at GripperLockTorqueLimit. Each further gripper command
+	// extends it. See gripperLockStep.
+	GripperLock            time.Duration
+	GripperLockTorqueLimit int
 
 	MoveTimeout          time.Duration
 	MaxConsecutiveErrors int
+
+	// Feedback pulls the leader back when its follower cannot follow. Only with
+	// LeaderHold == HoldManual; see FeedbackConfig.
+	Feedback FeedbackConfig
 }
 
 // alignReachToleranceDeg is how far any joint may be from the IK target after the blocking
@@ -129,6 +141,12 @@ type Status struct {
 	AlignPosErrMM     float64 `json:"align_position_error_mm"`
 	AlignOriErrDeg    float64 `json:"align_orientation_error_deg"`
 	GripperPct        float64 `json:"gripper_pct"`
+	// Blocked is true while the follower cannot follow and (with feedback on) the leader is
+	// being pulled back; BlockedReason says why.
+	Blocked       bool   `json:"blocked"`
+	BlockedReason string `json:"blocked_reason"`
+	// GripperLocked is true while gripper_lock has the pair frozen.
+	GripperLocked bool `json:"gripper_locked"`
 }
 
 // Engine runs one leader→follower Cartesian mirror session.
@@ -168,6 +186,20 @@ type Engine struct {
 	// loop, so gripper writes are asynchronous and latest-wins like the pose sends.
 	gripperInFlight atomic.Bool
 	gripperPending  atomic.Value // float64: a percentage that arrived while one was in flight
+
+	// Gripper lock (Config.GripperLock). lockUntil is unix nanos, 0 when unlocked; it is read
+	// by the feedback loop, so it is atomic. lockJoints is where the leader is held, and is
+	// touched only by the mirror loop.
+	lockUntil  atomic.Int64
+	lockJoints []referenceframe.Input
+
+	// Blocked-follower feedback (nil fb when off). model is the leader's kinematics: with
+	// feedback on, the mirror reads the leader's JOINTS and does forward kinematics itself,
+	// because it must remember joints to pull the leader back to, and reading EndPosition as
+	// well would cost a second bus read per cycle.
+	fb         *feedbackState
+	fbFollower atomic.Pointer[spatialmath.Pose]
+	model      referenceframe.Model
 }
 
 // New returns an Engine. It does nothing until Start.
@@ -195,6 +227,9 @@ func New(deps Deps, cfg Config) *Engine {
 	}
 	if cfg.GripperDeadbandPct <= 0 {
 		cfg.GripperDeadbandPct = 3
+	}
+	if cfg.Feedback.Enabled {
+		cfg.Feedback = cfg.Feedback.withDefaults()
 	}
 	return &Engine{deps: deps, cfg: cfg}
 }
@@ -236,14 +271,31 @@ func (e *Engine) Start(ctx context.Context) error {
 	e.cycles, e.sends, e.dropped = 0, 0, 0
 	e.consecutiveErrors, e.lastError = 0, ""
 	e.gripperSent, e.gripperOpen = false, nil
+	e.lockUntil.Store(0)
+	e.lockJoints = nil
 	e.sessionLost.Store(false)
 	e.inFlight.Store(false)
+
+	e.fb = nil
+	if e.cfg.Feedback.Enabled && e.cfg.LeaderHold == HoldManual {
+		model, err := e.deps.Leader.Kinematics(ctx)
+		if err != nil {
+			e.deps.Logger.Warnf("blocked feedback off: leader kinematics: %v", err)
+		} else {
+			e.model = model
+			e.fb = &feedbackState{}
+		}
+	}
 
 	loopCtx, cancel := context.WithCancel(context.Background())
 	e.cancel = cancel
 	e.running = true
 	e.wg.Add(1)
 	go e.runLoop(loopCtx)
+	if e.fb != nil {
+		e.wg.Add(1)
+		go e.runFeedback(loopCtx)
+	}
 	if al.Aligned {
 		e.deps.Logger.Infof("Cartesian teleop started at %.0f Hz; leader aligned to %.1f mm / %.1f deg of the follower",
 			e.cfg.RateHz, al.PositionErrorMM, al.OrientationErrorDeg)
@@ -370,6 +422,10 @@ func (e *Engine) alignLeader(ctx context.Context) (*Alignment, error) {
 		res.Inputs = after
 	}
 	if err := e.applyHold(ctx); err != nil {
+		// The move left the leader stiff at the aligned pose and the hold may be half
+		// applied (a manual-mode entry that failed partway). Release so it is not stranded
+		// in whatever state the failure left it, and let the caller log the reason.
+		e.releaseLeader(ctx)
 		return nil, err
 	}
 
@@ -514,6 +570,10 @@ func (e *Engine) Status() Status {
 	if e.align != nil {
 		st.AlignPosErrMM, st.AlignOriErrDeg = e.align.PositionErrorMM, e.align.OrientationErrorDeg
 	}
+	if e.fb != nil {
+		st.Blocked, st.BlockedReason = e.fb.snapshot()
+	}
+	st.GripperLocked = e.gripperLocked()
 	return st
 }
 
@@ -573,12 +633,30 @@ func (e *Engine) tick(ctx context.Context) bool {
 // syncOnce reads the leader, maps and filters the target, and hands it to the pipeline
 // with at most one move in flight (latest wins, like the vive module and the mobile app).
 func (e *Engine) syncOnce(ctx context.Context) error {
-	pose, err := e.deps.Leader.EndPosition(ctx, nil)
-	if err != nil {
+	if e.gripperLockStep(ctx) {
+		// Frozen: the follower keeps its last target and the leader is held. Only the
+		// gripper is mirrored, and each new gripper command extends the lock.
+		return e.mirrorGripper(ctx)
+	}
+	var pose spatialmath.Pose
+	var joints []referenceframe.Input
+	var err error
+	if e.fb != nil {
+		if joints, err = e.deps.Leader.JointPositions(ctx, nil); err != nil {
+			return fmt.Errorf("read leader joints: %w", err)
+		}
+		// The same clamp-then-transform the so101 arm's EndPosition does.
+		if pose, err = geometry.ComputeOOBPosition(e.model, joints); err != nil {
+			return fmt.Errorf("leader forward kinematics: %w", err)
+		}
+	} else if pose, err = e.deps.Leader.EndPosition(ctx, nil); err != nil {
 		return fmt.Errorf("read leader pose: %w", err)
 	}
 	target := e.MapTarget(pose)
 	e.maybeLogPose(pose, target)
+	if e.fb != nil {
+		e.fb.record(leaderSample{at: e.deps.Now(), joints: joints, target: target}, e.cfg.Feedback.History)
+	}
 
 	e.mu.Lock()
 	filter := e.filter
@@ -620,6 +698,9 @@ func (e *Engine) sendMove(target spatialmath.Pose) {
 	e.lastSentPose.Store(&target)
 	ctx, cancel := context.WithTimeout(context.Background(), e.cfg.MoveTimeout)
 	defer cancel()
+	if e.fb != nil {
+		e.fb.setLastSent(target)
+	}
 	start := time.Now()
 	err := e.deps.Pipeline.Move(ctx, target)
 	e.lastRPCNanos.Store(time.Since(start).Nanoseconds())
@@ -666,6 +747,7 @@ func (e *Engine) mirrorGripper(ctx context.Context) error {
 	if !changed {
 		return nil
 	}
+	e.engageGripperLock(ctx)
 	if e.gripperInFlight.CompareAndSwap(false, true) {
 		go e.writeGripper(pct)
 	} else {
@@ -734,4 +816,70 @@ func (e *Engine) writeGripperOnce(ctx context.Context, pct float64) error {
 		e.mu.Unlock()
 	}
 	return nil
+}
+
+// gripperLocked reports whether gripper_lock has the pair frozen right now.
+func (e *Engine) gripperLocked() bool {
+	until := e.lockUntil.Load()
+	return until != 0 && e.deps.Now().UnixNano() < until
+}
+
+// engageGripperLock starts or extends the gripper lock. The first engagement reads where the
+// leader is and holds it there; an extension re-issues the hold with a TTL covering the new
+// deadline. The hold's TTL is the backstop: if this loop dies, the leader frees itself.
+// Called from the mirror loop only.
+func (e *Engine) engageGripperLock(ctx context.Context) {
+	if e.cfg.GripperLock <= 0 {
+		return
+	}
+	now := e.deps.Now()
+	if e.lockUntil.Load() == 0 {
+		e.deps.Logger.Debugf("gripper lock: pair frozen for %v while the follower gripper moves", e.cfg.GripperLock)
+	}
+	e.lockUntil.Store(now.Add(e.cfg.GripperLock).UnixNano())
+	if e.cfg.LeaderHold != HoldManual {
+		return // stiff is already held; torque_off has nothing to hold with
+	}
+	if e.lockJoints == nil {
+		joints, err := e.deps.Leader.JointPositions(ctx, nil)
+		if err != nil {
+			e.deps.Logger.Warnf("gripper lock: read leader joints: %v (follower paused, leader not held)", err)
+			return
+		}
+		e.lockJoints = joints
+	}
+	joints := make([]interface{}, len(e.lockJoints))
+	for i, v := range e.lockJoints {
+		joints[i] = float64(v)
+	}
+	if _, err := e.deps.Leader.DoCommand(ctx, map[string]interface{}{
+		"command":      "manual_hold",
+		"joints":       joints,
+		"torque_limit": float64(e.cfg.GripperLockTorqueLimit),
+		// Margin past the deadline so the hold does not lapse a tick before the release.
+		"ttl_ms": float64((e.cfg.GripperLock + 300*time.Millisecond).Milliseconds()),
+	}); err != nil {
+		e.deps.Logger.Warnf("gripper lock: manual_hold: %v", err)
+	}
+}
+
+// gripperLockStep reports whether the pair is frozen this tick, and releases the leader on
+// the first tick after the lock expires. The leader was held at the pose the follower was
+// last sent toward, so mirroring resumes without a jump. Called from the mirror loop only.
+func (e *Engine) gripperLockStep(ctx context.Context) bool {
+	if e.lockUntil.Load() == 0 {
+		return false
+	}
+	if e.gripperLocked() {
+		return true
+	}
+	e.lockUntil.Store(0)
+	if e.lockJoints != nil {
+		e.lockJoints = nil
+		if _, err := e.deps.Leader.DoCommand(ctx, map[string]interface{}{"command": "manual_release"}); err != nil {
+			e.deps.Logger.Warnf("gripper lock: manual_release: %v", err)
+		}
+	}
+	e.deps.Logger.Debug("gripper lock: released")
+	return false
 }
