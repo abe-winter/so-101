@@ -46,6 +46,21 @@ func manualStep(goal, actual float64, limit [2]float64, p manualParams) (newGoal
 	return ng, ng != goal
 }
 
+// holdStep moves a joint's goal toward a hold target by at most maxStep (radians), clamped to
+// limit. It is the spring-back half of manual mode: the goal approaches the target at a bounded
+// rate rather than being written in one step, because manual-mode goal writes carry Speed 0,
+// which is the servo's MAXIMUM speed -- a single far goal would snap the arm into the hand.
+func holdStep(goal, target, maxStep float64, limit [2]float64) (newGoal float64, moved bool) {
+	d := target - goal
+	if d > maxStep {
+		d = maxStep
+	} else if d < -maxStep {
+		d = -maxStep
+	}
+	ng := math.Max(limit[0], math.Min(limit[1], goal+d))
+	return ng, ng != goal
+}
+
 // manualIO is the seam between the manual-mode loop and the hardware controller.
 type manualIO interface {
 	servoIDs() []int
@@ -55,7 +70,29 @@ type manualIO interface {
 	writeGoals(ctx context.Context, goals map[int]float64) error
 	applyCompliance(ctx context.Context, pGain, torqueLimit int) error // each arg 0 = leave that register unchanged
 	restoreCompliance(ctx context.Context) error
+	// setTorqueLimit writes the torque_limit register on every servo. It is a RAM register, so
+	// a hold may raise and lower it as often as it likes (p_gain, in EEPROM, may not).
+	setTorqueLimit(ctx context.Context, torqueLimit int) error
 }
+
+// manualHold is a time-limited override of the follow-the-hand law: the goals approach target
+// at a bounded rate and stay there until released or deadline passes. A caller (the Cartesian
+// teleop's blocked-follower feedback) refreshes it while it wants it; if the caller dies, the
+// deadline hands the arm back to the hand on its own.
+type manualHold struct {
+	target   map[int]float64
+	deadline time.Time
+	maxSpeed float64 // radians per second
+}
+
+const (
+	// defaultHoldTTL is how long a hold lasts without a refresh.
+	defaultHoldTTL = 500 * time.Millisecond
+	maxHoldTTL     = 5 * time.Second
+	// defaultHoldSpeedDegPerSec bounds how fast a hold pulls the arm toward its target.
+	defaultHoldSpeedDegPerSec = 45.0
+	maxHoldSpeedDegPerSec     = 180.0
+)
 
 const maxConsecutiveLoopErrors = 10
 
@@ -73,6 +110,13 @@ type manualSession struct {
 	mu    sync.Mutex
 	state map[int]jointState
 	run   bool
+	// hold, when non-nil, overrides the follow-the-hand law. holdTorque is the torque_limit the
+	// hold applied (0 = it left the register alone); reseed asks the next tick to re-anchor
+	// every goal at the measured position, so releasing a hold the hand is pushing against
+	// does not snap the arm back to the hold target's last goal.
+	hold       *manualHold
+	holdTorque int
+	reseed     bool
 }
 
 func newManualSession(parent context.Context, io manualIO, p manualParams, pGain, torqueLimit int, logger logging.Logger) *manualSession {
@@ -162,15 +206,38 @@ func (m *manualSession) tick() error {
 	loads, _ := m.io.loadsFor(m.ctx) // telemetry only; a load read failure must not stop control
 	limits := m.io.limitsFor()
 
-	goals := map[int]float64{}
 	m.mu.Lock()
+	if m.hold != nil && time.Now().After(m.hold.deadline) {
+		m.mu.Unlock()
+		if err := m.releaseHold(m.ctx); err != nil {
+			m.logger.Warnf("manual mode: releasing expired hold: %v", err)
+		}
+		m.mu.Lock()
+	}
+	hold, reseed := m.hold, m.reseed
+	m.reseed = false
+
+	goals := map[int]float64{}
 	for id, st := range m.state {
 		lim, ok := limits[id]
 		if !ok {
 			lim = [2]float64{-math.Pi, math.Pi}
 		}
 		actual := pos[id]
-		ng, moved := manualStep(st.goal, actual, lim, m.params)
+		var ng float64
+		var moved bool
+		switch {
+		case hold != nil:
+			target, ok := hold.target[id]
+			if !ok {
+				target = st.goal
+			}
+			ng, moved = holdStep(st.goal, target, hold.maxSpeed*m.params.dt, lim)
+		case reseed:
+			ng, moved = math.Max(lim[0], math.Min(lim[1], actual)), true
+		default:
+			ng, moved = manualStep(st.goal, actual, lim, m.params)
+		}
 		st.goal = ng
 		st.actual = actual
 		if loads != nil {
@@ -187,6 +254,78 @@ func (m *manualSession) tick() error {
 		return m.io.writeGoals(m.ctx, goals)
 	}
 	return nil
+}
+
+// setHold starts or refreshes a hold. target is keyed by servo id; torqueLimit > 0 raises the
+// torque cap for the duration (only when the session manages that register, so a release can
+// put it back); ttl and maxSpeedDegPerSec of 0 select the defaults.
+func (m *manualSession) setHold(ctx context.Context, target map[int]float64, torqueLimit int, ttl time.Duration, maxSpeedDegPerSec float64) error {
+	if ttl <= 0 {
+		ttl = defaultHoldTTL
+	}
+	if ttl > maxHoldTTL {
+		ttl = maxHoldTTL
+	}
+	if maxSpeedDegPerSec <= 0 {
+		maxSpeedDegPerSec = defaultHoldSpeedDegPerSec
+	}
+	if maxSpeedDegPerSec > maxHoldSpeedDegPerSec {
+		maxSpeedDegPerSec = maxHoldSpeedDegPerSec
+	}
+	m.mu.Lock()
+	if !m.run {
+		m.mu.Unlock()
+		return fmt.Errorf("manual mode is not running")
+	}
+	for id := range target {
+		if _, ok := m.state[id]; !ok {
+			m.mu.Unlock()
+			return fmt.Errorf("servo %d is not under manual control", id)
+		}
+	}
+	m.hold = &manualHold{target: target, deadline: time.Now().Add(ttl), maxSpeed: maxSpeedDegPerSec * math.Pi / 180}
+	m.reseed = false
+	// Only a session that set torque_limit itself knows the value to restore; with an
+	// explicit 0 override (register left alone) the hold keeps whatever torque is there.
+	wantTorque := 0
+	if m.torqueLimit > 0 && torqueLimit > 0 {
+		wantTorque = torqueLimit
+	}
+	change := wantTorque != m.holdTorque
+	m.holdTorque = wantTorque
+	m.mu.Unlock()
+
+	if change && wantTorque > 0 {
+		return m.io.setTorqueLimit(ctx, wantTorque)
+	}
+	return nil
+}
+
+// releaseHold ends a hold: the torque cap returns to the session's compliance value and every
+// goal is re-anchored at the measured position, so a hand holding the arm away from the hold
+// target is not yanked when the hold lets go. A no-op without a hold.
+func (m *manualSession) releaseHold(ctx context.Context) error {
+	m.mu.Lock()
+	if m.hold == nil {
+		m.mu.Unlock()
+		return nil
+	}
+	m.hold = nil
+	m.reseed = true
+	restore := m.holdTorque > 0
+	m.holdTorque = 0
+	torque := m.torqueLimit
+	m.mu.Unlock()
+	if restore {
+		return m.io.setTorqueLimit(ctx, torque)
+	}
+	return nil
+}
+
+func (m *manualSession) holding() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.hold != nil
 }
 
 // manualJointStatus is one joint's live telemetry for Status().
@@ -321,6 +460,16 @@ func (a *controllerManualIO) applyCompliance(ctx context.Context, pGain, torqueL
 				[]byte{byte(torqueLimit & 0xFF), byte((torqueLimit >> 8) & 0xFF)}); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+func (a *controllerManualIO) setTorqueLimit(ctx context.Context, torqueLimit int) error {
+	for _, id := range a.ids {
+		if err := a.controller.WriteServoRegister(ctx, id, "torque_limit",
+			[]byte{byte(torqueLimit & 0xFF), byte((torqueLimit >> 8) & 0xFF)}); err != nil {
+			return fmt.Errorf("write torque_limit servo %d: %w", id, err)
 		}
 	}
 	return nil

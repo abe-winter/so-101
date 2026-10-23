@@ -3,6 +3,8 @@ package arm
 import (
 	"context"
 	"fmt"
+	"math"
+	"time"
 
 	"so_arm/internal/controller"
 	"so_arm/internal/servo"
@@ -30,7 +32,7 @@ func (s *so101) Status(ctx context.Context) (map[string]interface{}, error) {
 		}
 		return map[string]interface{}{
 			"mode":        "manual",
-			"manual_mode": map[string]interface{}{"joints": joints},
+			"manual_mode": map[string]interface{}{"joints": joints, "hold": s.manual.holding()},
 		}, nil
 	}
 	return map[string]interface{}{"mode": "auto"}, nil
@@ -208,6 +210,21 @@ func (s *so101) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[
 		s.exitManualLocked("exit_manual_mode command")
 		return map[string]interface{}{"mode": "auto"}, nil
 
+	case "manual_hold":
+		return s.manualHoldCommand(ctx, cmd)
+
+	case "manual_release":
+		s.mu.RLock()
+		sess := s.manual
+		s.mu.RUnlock()
+		if sess == nil || !sess.running() {
+			return map[string]interface{}{"hold": false}, nil
+		}
+		if err := sess.releaseHold(ctx); err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{"hold": false}, nil
+
 	case "set_torque_limit":
 		return s.setTorqueLimitDiag(ctx, cmd)
 
@@ -265,4 +282,51 @@ func (s *so101) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[
 
 		return nil, fmt.Errorf("unknown command: %v", cmd)
 	}
+}
+
+// manualHoldCommand starts or refreshes a hold inside a running manual-mode session: the arm
+// is pulled toward "joints" (radians, arm servo order, the units JointPositions reports) at a
+// bounded speed with an optional raised torque cap, until manual_release or until ttl_ms
+// passes without a refresh. It is how the Cartesian teleop pushes a leader back toward the
+// last pose its follower could reach. It refuses outside manual mode rather than entering it:
+// the caller owns the mode, and a hold must never be the thing that stiffens an idle arm.
+func (s *so101) manualHoldCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	raw, ok := cmd["joints"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("manual_hold requires 'joints': a list of %d joint positions in radians", len(s.armServoIDs))
+	}
+	if len(raw) != len(s.armServoIDs) {
+		return nil, fmt.Errorf("manual_hold: expected %d joints, got %d", len(s.armServoIDs), len(raw))
+	}
+	target := make(map[int]float64, len(raw))
+	for i, v := range raw {
+		f, ok := v.(float64)
+		if !ok || math.IsNaN(f) || math.IsInf(f, 0) {
+			return nil, fmt.Errorf("manual_hold: joint %d is not a number: %v", i, v)
+		}
+		target[s.armServoIDs[i]] = f
+	}
+	torque := 0
+	if v, ok := cmd["torque_limit"].(float64); ok {
+		if v < 0 || v > 1000 {
+			return nil, fmt.Errorf("manual_hold: torque_limit must be in [0,1000], got %v", v)
+		}
+		torque = int(v)
+	}
+	var ttl time.Duration
+	if v, ok := cmd["ttl_ms"].(float64); ok && v > 0 {
+		ttl = time.Duration(v * float64(time.Millisecond))
+	}
+	speed, _ := cmd["max_speed_deg_per_sec"].(float64)
+
+	s.mu.RLock()
+	sess := s.manual
+	s.mu.RUnlock()
+	if sess == nil || !sess.running() {
+		return nil, fmt.Errorf("manual_hold requires manual mode (enter_manual_mode first)")
+	}
+	if err := sess.setHold(ctx, target, torque, ttl, speed); err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{"hold": true}, nil
 }

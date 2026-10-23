@@ -90,6 +90,7 @@ type fakeIO struct {
 	torqueApplied      int
 	complianceRestored bool
 	writes             int
+	torqueWrites       []int
 }
 
 func (f *fakeIO) servoIDs() []int { return f.ids }
@@ -136,6 +137,13 @@ func (f *fakeIO) restoreCompliance(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.complianceRestored = true
+	return nil
+}
+
+func (f *fakeIO) setTorqueLimit(ctx context.Context, torqueLimit int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.torqueWrites = append(f.torqueWrites, torqueLimit)
 	return nil
 }
 

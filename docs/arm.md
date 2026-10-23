@@ -574,6 +574,25 @@ While manual mode is active, it also reports live per-joint telemetry (`actual_d
 }
 ```
 
+**Holding the arm from outside (`manual_hold` / `manual_release`).** While manual mode is
+active, a caller can override the follow-the-hand behaviour for a short time. The Cartesian
+teleop uses this to push a leader back toward the last pose its follower reached:
+
+```json
+{ "command": "manual_hold", "joints": [0.1, -0.3, 0.6, 0.2, 0.0], "torque_limit": 250, "ttl_ms": 300, "max_speed_deg_per_sec": 45 }
+{ "command": "manual_release" }
+```
+
+`joints` are radians in arm-servo order, the units `JointPositions` reports. The goals move
+toward them at no more than `max_speed_deg_per_sec` (default `45`, max `180`). Manual-mode
+goal writes run at the servo's maximum speed, so a single far goal would snap the arm. The
+optional `torque_limit` raises the torque cap for the hold. It is restored on release, and is
+left alone when manual mode was entered with an explicit `torque_limit: 0`. A hold lasts
+`ttl_ms` (default `500`, max `5000`) unless refreshed, so a caller that dies cannot leave the
+arm stiff. On release or expiry every goal re-anchors at the arm's measured position, so a
+hand holding the arm away from the hold target is not yanked. `manual_hold` refuses outside
+manual mode. Status reports `manual_mode.hold`.
+
 **Tuning diagnostic:** the `set_torque_limit` DoCommand writes the `torque_limit` register directly on every arm servo, so you can find the lowest value that still holds the arm before dialing it into `manual_mode`. It requires manual mode to be off and does **not** auto-restore — set it back to `1000` (or reinitialize) when done.
 
 ```json
