@@ -326,10 +326,16 @@ func (e *Engine) captureLeader(ctx context.Context) (*Alignment, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read leader joints: %w", err)
 	}
-	// A compliant leader from a previous session is fine to keep, but re-entering with the
-	// configured overrides keeps the hold consistent across sessions.
-	if _, err := e.deps.Leader.DoCommand(ctx, map[string]interface{}{"command": "exit_manual_mode"}); err != nil {
-		e.deps.Logger.Debugf("exit_manual_mode before capture: %v", err)
+	// Torque-off capture must not run exit_manual_mode first: restoring the manual session's
+	// full-stiffness registers has been observed to leave the leader driving even after the
+	// following group torque-disable. A fresh torque-off session has no manual loop to stop;
+	// applyHold below is the only state transition it needs.
+	if e.cfg.LeaderHold != HoldTorqueOff {
+		// A compliant leader from a previous session is fine to keep, but re-entering with the
+		// configured overrides keeps the hold consistent across sessions.
+		if _, err := e.deps.Leader.DoCommand(ctx, map[string]interface{}{"command": "exit_manual_mode"}); err != nil {
+			e.deps.Logger.Debugf("exit_manual_mode before capture: %v", err)
+		}
 	}
 	if err := e.applyHold(ctx); err != nil {
 		return nil, err

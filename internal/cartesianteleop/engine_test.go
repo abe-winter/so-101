@@ -417,7 +417,9 @@ func TestSessionLostStopsTheLoopButLeavesTheLeaderHeld(t *testing.T) {
 	test.That(t, leader.commandNames()[len(leader.commandNames())-1], test.ShouldEqual, "exit_manual_mode")
 }
 
-func TestStopReleasesTheLeaderAndTheFollower(t *testing.T) {
+func TestCaptureTorqueOffSkipsManualExitAndStopReleasesBothSides(t *testing.T) {
+	captureModeTests = true
+	defer func() { captureModeTests = false }()
 	m := Mapping{}
 	leader := newFakeLeader(t, []referenceframe.Input{0, 0, 0, 0, 0})
 	motion := &fakeMotion{pose: followerPoseReachableBy(t, leader, m, []referenceframe.Input{0.1, -0.3, 0.6, 0.2, 0})}
@@ -425,14 +427,14 @@ func TestStopReleasesTheLeaderAndTheFollower(t *testing.T) {
 
 	ctx := context.Background()
 	test.That(t, e.Start(ctx), test.ShouldBeNil)
-	test.That(t, leader.commandNames(), test.ShouldResemble, []string{"exit_manual_mode", "set_torque"})
-	test.That(t, leader.commands[1]["enable"], test.ShouldEqual, false)
+	test.That(t, leader.commandNames(), test.ShouldResemble, []string{"set_torque"})
+	test.That(t, leader.commands[0]["enable"], test.ShouldEqual, false)
 
 	test.That(t, e.Stop(ctx), test.ShouldBeNil)
 	test.That(t, motion.stops, test.ShouldEqual, 1)
 	// Torque back on, and only after a goal seed at the present position.
-	test.That(t, len(leader.moves), test.ShouldEqual, 2)
-	test.That(t, leader.moves[1]["wait"], test.ShouldEqual, false)
+	test.That(t, len(leader.moves), test.ShouldEqual, 1)
+	test.That(t, leader.moves[0]["wait"], test.ShouldEqual, false)
 	names := leader.commandNames()
 	test.That(t, names[len(names)-1], test.ShouldEqual, "set_torque")
 	test.That(t, leader.commands[len(leader.commands)-1]["enable"], test.ShouldEqual, true)
