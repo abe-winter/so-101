@@ -489,17 +489,20 @@ func (e *Engine) applyHold(ctx context.Context) error {
 			return fmt.Errorf("enter leader manual mode: %w", err)
 		}
 	case HoldTorqueOff:
-		if _, err := e.deps.Leader.DoCommand(ctx, map[string]interface{}{"command": "set_torque", "enable": false}); err != nil {
+		e.deps.Logger.Info("Torque-off leader: disabling torque")
+		result, err := e.deps.Leader.DoCommand(ctx, map[string]interface{}{"command": "set_torque", "enable": false})
+		if err != nil {
 			return fmt.Errorf("disable leader torque: %w", err)
 		}
+		e.deps.Logger.Infow("Torque-off leader disabled", "readback", result)
 	case HoldStiff:
 	}
 	return nil
 }
 
-// releaseLeader undoes applyHold and leaves the leader holding its current pose. Torque is
-// re-enabled only after the goal register is seeded with the present position, because a
-// bare torque enable resumes driving toward whatever goal the servo last held.
+// releaseLeader undoes holds that should be released. A torque-off leader deliberately stays
+// limp: this deployment uses it only as an input device, and an old service instance may close
+// after its replacement starts.
 func (e *Engine) releaseLeader(ctx context.Context) {
 	switch e.cfg.LeaderHold {
 	case HoldManual:
@@ -507,22 +510,13 @@ func (e *Engine) releaseLeader(ctx context.Context) {
 			e.deps.Logger.Warnf("exit leader manual mode: %v", err)
 		}
 	case HoldTorqueOff:
-		if cur, err := e.deps.Leader.JointPositions(ctx, nil); err != nil {
-			e.deps.Logger.Warnf("seed leader goal before torque enable: %v (leaving torque off)", err)
-			return
-		} else if err := e.deps.Leader.MoveToJointPositions(ctx, cur, map[string]interface{}{"wait": false}); err != nil {
-			e.deps.Logger.Warnf("seed leader goal before torque enable: %v (leaving torque off)", err)
-			return
-		}
-		if _, err := e.deps.Leader.DoCommand(ctx, map[string]interface{}{"command": "set_torque", "enable": true}); err != nil {
-			e.deps.Logger.Warnf("re-enable leader torque: %v", err)
-		}
+		e.deps.Logger.Info("Torque-off leader: leaving torque disabled on session close")
 	case HoldStiff:
 	}
 }
 
-// Stop ends the session: the loop stops, the follower is removed from the pipeline and holds
-// where it is, and the leader is released from its hold.
+// Stop ends the session: the loop stops and the follower is removed from the pipeline. Manual
+// leaders leave manual mode; torque-off leaders deliberately stay limp.
 func (e *Engine) Stop(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()

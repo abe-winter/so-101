@@ -417,7 +417,7 @@ func TestSessionLostStopsTheLoopButLeavesTheLeaderHeld(t *testing.T) {
 	test.That(t, leader.commandNames()[len(leader.commandNames())-1], test.ShouldEqual, "exit_manual_mode")
 }
 
-func TestCaptureTorqueOffSkipsManualExitAndStopReleasesBothSides(t *testing.T) {
+func TestCaptureTorqueOffSkipsManualExitAndStaysDisabledOnStop(t *testing.T) {
 	captureModeTests = true
 	defer func() { captureModeTests = false }()
 	m := Mapping{}
@@ -432,12 +432,11 @@ func TestCaptureTorqueOffSkipsManualExitAndStopReleasesBothSides(t *testing.T) {
 
 	test.That(t, e.Stop(ctx), test.ShouldBeNil)
 	test.That(t, motion.stops, test.ShouldEqual, 1)
-	// Torque back on, and only after a goal seed at the present position.
-	test.That(t, len(leader.moves), test.ShouldEqual, 1)
-	test.That(t, leader.moves[0]["wait"], test.ShouldEqual, false)
-	names := leader.commandNames()
-	test.That(t, names[len(names)-1], test.ShouldEqual, "set_torque")
-	test.That(t, leader.commands[len(leader.commands)-1]["enable"], test.ShouldEqual, true)
+	// This deployment's leader is only an input device: closing an old session must not race
+	// a replacement session by turning torque back on.
+	test.That(t, leader.moves, test.ShouldBeEmpty)
+	test.That(t, leader.commandNames(), test.ShouldResemble, []string{"set_torque"})
+	test.That(t, leader.commands[0]["enable"], test.ShouldEqual, false)
 	test.That(t, e.Status().Running, test.ShouldBeFalse)
 }
 

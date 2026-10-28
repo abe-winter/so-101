@@ -47,10 +47,10 @@ can and the gap is absorbed into the offset (and logged when it is large). Set
 to its *calibrated* range, which the model does not know) is accepted and absorbed into the
 offset; only an arm that does not move at all is refused.
 
-On **stop**, the follower is removed from the pipeline and holds where it is; the leader is
-released from its hold (manual mode exits and the arm holds its current pose; in
-`torque_off` mode the goal is seeded at the present position *before* torque is re-enabled,
-so the arm does not snap).
+On **stop**, the follower is removed from the pipeline and holds where it is. Manual mode exits
+and leaves the leader holding its current pose. A `torque_off` leader deliberately stays limp:
+teleop never enables torque for an arm used only as an input device, including during service
+replacement and shutdown.
 
 ## The mapping
 

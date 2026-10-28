@@ -48,6 +48,34 @@ func regDecodeLE(data []byte) int {
 	return v
 }
 
+// torqueEnableReadback reads every arm servo's torque_enable register. The rows use only
+// structpb-native values because DoCommand responses cross gRPC as protobuf Structs.
+func (s *so101) torqueEnableReadback(ctx context.Context, want *bool) ([]interface{}, bool) {
+	rows := make([]interface{}, 0, len(s.armServoIDs))
+	allMatch := true
+	for _, id := range s.armServoIDs {
+		row := map[string]interface{}{"servo": id}
+		data, err := s.controller.ReadServoRegister(ctx, id, "torque_enable")
+		if err != nil {
+			row["error"] = err.Error()
+			allMatch = false
+		} else if len(data) != 1 {
+			row["error"] = fmt.Sprintf("unexpected torque_enable width %d", len(data))
+			allMatch = false
+		} else {
+			enabled := data[0] != 0
+			row["enabled"] = enabled
+			if want != nil {
+				matches := enabled == *want
+				row["matches"] = matches
+				allMatch = allMatch && matches
+			}
+		}
+		rows = append(rows, row)
+	}
+	return rows, allMatch
+}
+
 // setTorqueLimitDiag is a diagnostic that writes the torque_limit register directly on every
 // arm servo, in isolation from manual mode, so you can confirm the register actually governs
 // holding torque on this firmware (e.g. value 10 should make the arm droop; 1000 restores full
@@ -105,8 +133,30 @@ func (s *so101) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[
 		if !ok {
 			return nil, fmt.Errorf("set_torque command requires 'enable' boolean parameter")
 		}
-		err := s.controller.SetTorqueEnable(ctx, enable)
-		return map[string]interface{}{"success": err == nil}, err
+		if err := s.controller.SetTorqueEnable(ctx, enable); err != nil {
+			s.logger.Warnf("set_torque enable=%t write failed: %v", enable, err)
+			return map[string]interface{}{"success": false, "enable": enable}, err
+		}
+		servos, allMatch := s.torqueEnableReadback(ctx, &enable)
+		if allMatch {
+			s.logger.Infof("set_torque enable=%t confirmed on servos %v", enable, s.armServoIDs)
+		} else {
+			s.logger.Warnf("set_torque enable=%t readback did not match: %v", enable, servos)
+		}
+		return map[string]interface{}{
+			"success":   true,
+			"enable":    enable,
+			"all_match": allMatch,
+			"servos":    servos,
+		}, nil
+
+	case "get_torque":
+		servos, allReadable := s.torqueEnableReadback(ctx, nil)
+		return map[string]interface{}{
+			"success":      allReadable,
+			"all_readable": allReadable,
+			"servos":       servos,
+		}, nil
 
 	case "ping":
 		err := s.controller.Ping(ctx)

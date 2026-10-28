@@ -56,6 +56,26 @@ Enable or disable joint torque:
 }
 ```
 
+The response reads `torque_enable` back from every arm servo, so a successful bus write can be
+distinguished from the requested state actually sticking:
+
+```json
+{
+  "success": true,
+  "enable": false,
+  "all_match": true,
+  "servos": [
+    { "servo": 1, "enabled": false, "matches": true }
+  ]
+}
+```
+
+Read the same registers without changing them:
+
+```json
+{ "command": "get_torque" }
+```
+
 ### Ping Servos
 
 Test communication with all servos:
