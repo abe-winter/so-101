@@ -95,7 +95,7 @@ centered), not just somewhere mid-travel. The range recorded next only sets the 
 { "command": "save_calibration" }
 ```
 ```json
-{ "success": true, "state": "idle", "joints_calibrated": 6, "torque_enabled": true, "calibration_file": "/root/.viam/module-data/.../so101_calibration.json" }
+{ "success": true, "state": "idle", "joints_calibrated": 6, "torque_enabled": false, "calibration_file": "/root/.viam/module-data/.../so101_calibration.json" }
 ```
 
 `reset` is unconditionally safe and accepted from any state — it is the universal escape hatch.
@@ -303,13 +303,11 @@ the transient error is gone. `readings.error` stays empty,
 since that field is reserved for the `error` state. Only `reset` and a fresh `start` discard
 recorded ranges — a save failure never does.
 
-On success the module seeds each servo's `Goal_Position` with its live position and then
-re-enables holding torque, so the arm holds where it stands rather than driving toward a stale
-commanded target. The response carries `torque_enabled`, plus `torque_enable_error` when it is
-`false`. If re-enabling fails the save is still reported successful and the state still reaches
-`idle` — the calibration is already durable, so there is nothing to retry — but the arm stays
-unpowered and must be supported. `abort` and `reset` leave torque disabled by design: both are
-reached with the registers half-written and the user's hands on the arm.
+On success this torqueless branch leaves holding torque disabled and does not seed
+`Goal_Position`: STS3215 firmware treats a goal write as an implicit torque enable. The response
+therefore reports `torque_enabled: false` by policy. A failure to reassert torque-off is reported
+in `torque_enable_error`, but save still reaches `idle` because the calibration is already
+durable. The arm must remain supported. `abort` and `reset` also leave torque disabled.
 
 The calibration file is written **before** the servo registers. The file is the only durable
 record of the recording session — the recorded ranges otherwise live only in the sensor's

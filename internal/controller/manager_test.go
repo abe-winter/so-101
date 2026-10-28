@@ -180,6 +180,26 @@ func TestSetTorqueEnableAlwaysDisablesTheBus(t *testing.T) {
 	}
 }
 
+func TestTorquelessGoalWritesSuppressArmAndPreserveGripper(t *testing.T) {
+	ft := testfake.NewFakeTransport()
+	h := testHandle(t, ft)
+	ctx := context.Background()
+
+	require.NoError(t, h.MoveServosToPositions(ctx, []int{1, 6}, []float64{0, 0}, 0, 0))
+	assert.Zero(t, ft.WriteCount(1, feetech.RegGoalPosition.Address))
+	assert.Equal(t, 1, ft.WriteCount(6, feetech.RegGoalPosition.Address))
+
+	profiles := []ServoProfile{{SpeedSteps: 1, AccUnits: 1}, {SpeedSteps: 1, AccUnits: 1}}
+	require.NoError(t, h.MoveServosWithProfiles(ctx, []int{1, 6}, []float64{0, 0}, profiles))
+	assert.Zero(t, ft.WriteCount(1, feetech.RegAcceleration.Address))
+	assert.Equal(t, 1, ft.WriteCount(6, feetech.RegAcceleration.Address))
+
+	require.NoError(t, h.WriteServoRegister(ctx, 1, "goal_position", []byte{0, 8}))
+	assert.Zero(t, ft.WriteCount(1, feetech.RegGoalPosition.Address))
+	require.NoError(t, h.WriteServoRegister(ctx, 6, "goal_position", []byte{0, 8}))
+	assert.Equal(t, 2, ft.WriteCount(6, feetech.RegGoalPosition.Address))
+}
+
 // testArmIDs is the arm servo set; manager.go has a function-local armServoIDs.
 var testArmIDs = []int{1, 2, 3, 4, 5}
 

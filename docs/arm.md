@@ -57,6 +57,10 @@ it logs the IDs and immediately forces the whole bus off again. Every in-module 
 is logged with its caller stack; a false-to-true transition without such a write points to a
 device reset, firmware behavior, or another process using the serial port.
 
+Because STS3215 firmware re-enables torque on a `Goal_Position` write, this branch suppresses
+every goal write to arm servos 1-5 and logs the caller stack. Hardware arm move methods are
+therefore intentional no-ops. Servo 6 remains writable so the leader gripper still works.
+
 ```json
 { "command": "set_torque", "enable": true }
 ```

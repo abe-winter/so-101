@@ -35,19 +35,40 @@ type ControllerHandle struct {
 	releaseOnce sync.Once
 }
 
-// writePositions writes goal positions to the servo group. When speed > 0 it commands
-// every servo at the same goal velocity (independent-joint speed mode, steps/sec);
-// speed <= 0 uses the legacy max-speed path, which the gripper component relies on (it
-// always calls with speed 0).
-func writePositions(ctx context.Context, sess *busSession, rawPositions feetech.PositionMap, speed int) error {
+// writePositions writes only servo-6 goals on this torqueless branch. STS3215 firmware
+// re-enables torque when Goal_Position is written, so allowing an arm-joint goal would defeat
+// the branch invariant even though no caller explicitly enables torque.
+func (h *ControllerHandle) writePositions(ctx context.Context, sess *busSession, rawPositions feetech.PositionMap, speed int) error {
+	allowed := rawPositions
+	var blocked []int
+	for id := range rawPositions {
+		if !isGripperServo(id) {
+			blocked = append(blocked, id)
+		}
+	}
+	if len(blocked) != 0 {
+		if h.logger != nil {
+			h.logger.Warnf("Torqueless branch: suppressed goal-position write for arm servos %v\ncaller:\n%s",
+				blocked, debug.Stack())
+		}
+		allowed = make(feetech.PositionMap, len(rawPositions)-len(blocked))
+		for id, position := range rawPositions {
+			if isGripperServo(id) {
+				allowed[id] = position
+			}
+		}
+	}
+	if len(allowed) == 0 {
+		return nil
+	}
 	if speed > 0 {
-		speeds := make(feetech.PositionMap, len(rawPositions))
-		for id := range rawPositions {
+		speeds := make(feetech.PositionMap, len(allowed))
+		for id := range allowed {
 			speeds[id] = speed
 		}
-		return sess.group.SetPositionsWithSpeed(ctx, rawPositions, speeds)
+		return sess.group.SetPositionsWithSpeed(ctx, allowed, speeds)
 	}
-	return sess.group.SetPositions(ctx, rawPositions)
+	return sess.group.SetPositions(ctx, allowed)
 }
 
 func (h *ControllerHandle) MoveToJointPositions(ctx context.Context, jointAngles []float64, speed, acc int) error {
@@ -71,7 +92,7 @@ func (h *ControllerHandle) MoveToJointPositions(ctx context.Context, jointAngles
 			rawPositions[servoID] = raw
 		}
 
-		return writePositions(ctx, sess, rawPositions, speed)
+		return h.writePositions(ctx, sess, rawPositions, speed)
 	})
 }
 
@@ -106,7 +127,7 @@ func (h *ControllerHandle) MoveServosToPositions(ctx context.Context, servoIDs [
 			rawPositions[servoID] = raw
 		}
 
-		return writePositions(ctx, sess, rawPositions, speed)
+		return h.writePositions(ctx, sess, rawPositions, speed)
 	})
 }
 
@@ -140,12 +161,14 @@ func (h *ControllerHandle) MoveServosWithProfiles(
 	}
 
 	return h.withSession(func(sess *busSession) error {
-		goals := make(map[int]feetech.GoalRequest, len(servoIDs))
+		goals := make(map[int]feetech.GoalRequest, 1)
+		var blocked []int
 		for i, servoID := range servoIDs {
-			normalized := utils.RadToDeg(jointAngles[i])
-			if isGripperServo(servoID) {
-				normalized = (jointAngles[i]/math.Pi + 1.0) / 2.0 * 100.0
+			if !isGripperServo(servoID) {
+				blocked = append(blocked, servoID)
+				continue
 			}
+			normalized := (jointAngles[i]/math.Pi + 1.0) / 2.0 * 100.0
 			cs, ok := sess.servos[servoID]
 			if !ok {
 				return fmt.Errorf("servo %d not available", servoID)
@@ -161,16 +184,21 @@ func (h *ControllerHandle) MoveServosWithProfiles(
 				Time:     0,
 			}
 		}
+		if len(blocked) != 0 && h.logger != nil {
+			h.logger.Warnf("Torqueless branch: suppressed profiled goal write for arm servos %v\ncaller:\n%s",
+				blocked, debug.Stack())
+		}
+		if len(goals) == 0 {
+			return nil
+		}
 		return sess.group.SetGoals(ctx, goals)
 	})
 }
 
 // --- Single-servo operations backing the servo_* DoCommand family ---
 //
-// These exist so a gripper can drive one servo on this bus without holding a controller of
-// its own. Each holds the shared bus lock only for the duration of its bus transaction, and
-// each denormalizes through the servo's own calibration rather than assuming a NormMode --
-// servo 6 is Range100, but a 4-DOF arm may host a gripper on servo 5, which is Degrees.
+// This torqueless branch permits movement only for servo 6. The leader gripper still needs its
+// trigger path; arm-servo goals are suppressed by writePositions before they reach firmware.
 
 // MoveServoPercent moves one servo to a position given as a percentage of its calibrated
 // range. speed <= 0 uses the servo's configured speed.
@@ -189,7 +217,7 @@ func (h *ControllerHandle) MoveServoPercent(ctx context.Context, id int, percent
 		if err != nil {
 			return fmt.Errorf("failed to denormalize percent for servo %d: %w", id, err)
 		}
-		return writePositions(ctx, sess, feetech.PositionMap{id: raw}, speed)
+		return h.writePositions(ctx, sess, feetech.PositionMap{id: raw}, speed)
 	})
 }
 
@@ -208,7 +236,7 @@ func (h *ControllerHandle) MoveServoRaw(ctx context.Context, id, raw int) error 
 				raw = cal.RangeMax
 			}
 		}
-		return writePositions(ctx, sess, feetech.PositionMap{id: raw}, 0)
+		return h.writePositions(ctx, sess, feetech.PositionMap{id: raw}, 0)
 	})
 }
 
@@ -479,6 +507,13 @@ func (h *ControllerHandle) LoadForServos(ctx context.Context, servoIDs []int) (o
 // WriteServoRegister writes to a specific servo register by name. Torque-enable writes are
 // traced and forced off on this branch so the single-servo path cannot bypass SetTorqueEnable.
 func (h *ControllerHandle) WriteServoRegister(ctx context.Context, servoID int, registerName string, data []byte) error {
+	if registerName == "goal_position" && !isGripperServo(servoID) {
+		if h.logger != nil {
+			h.logger.Warnf("Torqueless branch: suppressed servo %d goal_position write %v\ncaller:\n%s",
+				servoID, data, debug.Stack())
+		}
+		return nil
+	}
 	if registerName == "torque_enable" {
 		if h.logger != nil {
 			h.logger.Warnf("Torqueless branch: servo %d torque_enable write %v forced to [0]\ncaller:\n%s",

@@ -415,38 +415,16 @@ func (cs *so101CalibrationSensor) saveCalibration(ctx context.Context) (map[stri
 		cs.logger.Debugf("Successfully wrote position limits to servo %d", servoID)
 	}
 
-	// Re-enable torque only now that every write above has landed, and only after seeding each
-	// servo's Goal_Position with where it physically is. Torque enable is a bare SyncWrite to
-	// RegTorqueEnable (ServoGroup.EnableAll), so the firmware resumes driving toward whatever
-	// goal it still holds -- stale after a hand-moved calibration, and reinterpreted through the
-	// position_offset set_homing wrote, so the arm can snap across its whole calibrated travel.
-	// If the seed fails, torque stays OFF rather than shipping that jerk.
-	//
-	// A failure here does NOT revert to StateCompleted: the calibration is already durably
-	// saved (file + registers), so there is nothing left to retry -- reverting would resurrect
-	// the save-retry deadlock this state machine was fixed to avoid. Instead it is reported via
-	// torque_enabled / torque_enable_error so the caller can warn the user the arm is limp.
-	torqueEnabled := true
+	// This branch is a hand-driven leader only. Goal_Position writes wake STS3215 torque in
+	// firmware, so calibration save neither seeds goals nor attempts to enable holding torque.
+	// Reassert the bus policy after the EEPROM writes and report the intentional limp state.
 	var torqueErr string
-	if err := cs.seedGoalPositions(ctx); err != nil {
-		torqueEnabled = false
+	if err := cs.controller.SetTorqueEnable(ctx, false); err != nil {
 		torqueErr = err.Error()
-		cs.logger.Errorf("Leaving torque disabled: %v", err)
-	} else if err := cs.controller.SetTorqueEnable(ctx, true); err != nil {
-		torqueEnabled = false
-		torqueErr = err.Error()
-		cs.logger.Errorf("Failed to re-enable torque after save: %v", err)
+		cs.logger.Errorf("Failed to reassert torqueless policy after calibration save: %v", err)
 	}
 
-	message := "Calibration completed and saved successfully. Torque re-enabled -- ready for new calibration."
-	if !torqueEnabled {
-		// Deliberately not "retry save_calibration": the state below is StateIdle, whose only
-		// available command is "start", so a retry would be rejected. The calibration itself is
-		// saved; only holding torque is missing.
-		message = fmt.Sprintf(
-			"Calibration saved successfully, but torque was left disabled: %s. The arm is limp -- support it before letting go, then power-cycle the servos or restart the machine to restore holding torque.",
-			torqueErr)
-	}
+	message := "Calibration completed and saved successfully. Torque remains disabled by this torqueless build."
 	cs.setState(StateIdle, message)
 
 	result := map[string]any{
@@ -454,10 +432,10 @@ func (cs *so101CalibrationSensor) saveCalibration(ctx context.Context) (map[stri
 		"state":             cs.state.String(),
 		"calibration_file":  calibrationPath,
 		"joints_calibrated": len(cs.joints),
-		"torque_enabled":    torqueEnabled,
+		"torque_enabled":    false,
 		"message":           cs.lastInstruction,
 	}
-	if !torqueEnabled {
+	if torqueErr != "" {
 		result["torque_enable_error"] = torqueErr
 	}
 	return result, nil
