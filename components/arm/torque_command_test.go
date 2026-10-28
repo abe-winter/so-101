@@ -26,10 +26,11 @@ func TestSetTorqueReportsPerServoReadback(t *testing.T) {
 
 	res, err := s.DoCommand(context.Background(), map[string]interface{}{
 		"command": "set_torque",
-		"enable":  false,
+		"enable":  true,
 	})
 	require.NoError(t, err)
 	assert.Equal(t, true, res["success"])
+	assert.Equal(t, true, res["requested_enable"])
 	assert.Equal(t, false, res["enable"])
 	assert.Equal(t, true, res["all_match"])
 

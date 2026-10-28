@@ -161,6 +161,21 @@ func TestHandleOperationsFailFastWhileDisconnected(t *testing.T) {
 	assert.False(t, h.ServoPresent(1), "no session means no servos")
 }
 
+func TestSetTorqueEnableAlwaysDisablesTheBus(t *testing.T) {
+	ft := testfake.NewFakeTransport()
+	for id := 1; id <= 6; id++ {
+		ft.SetRegister(id, feetech.RegTorqueEnable.Address, []byte{1})
+	}
+	h := testHandle(t, ft)
+
+	require.NoError(t, h.SetTorqueEnable(context.Background(), true))
+	for id := 1; id <= 6; id++ {
+		got, err := h.ReadServoRegister(context.Background(), id, "torque_enable")
+		require.NoError(t, err)
+		assert.Equal(t, []byte{0}, got, "servo %d must stay torqueless after an enable request", id)
+	}
+}
+
 // testArmIDs is the arm servo set; manager.go has a function-local armServoIDs.
 var testArmIDs = []int{1, 2, 3, 4, 5}
 

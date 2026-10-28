@@ -47,13 +47,13 @@ The module provides several custom commands accessible through the `DoCommand` i
 
 ### Set Torque Control
 
-Enable or disable joint torque:
+This experimental branch is **torqueless**: every group torque request writes
+`torque_enable=0`, including requests with `"enable": true`. This applies during arm
+initialization, calibration, teleop teardown, and direct `set_torque` calls. The argument is
+retained for wire compatibility, but it cannot enable the arm.
 
 ```json
-{
-  "command": "set_torque",
-  "enable": true
-}
+{ "command": "set_torque", "enable": true }
 ```
 
 The response reads `torque_enable` back from every arm servo, so a successful bus write can be
@@ -62,6 +62,7 @@ distinguished from the requested state actually sticking:
 ```json
 {
   "success": true,
+  "requested_enable": true,
   "enable": false,
   "all_match": true,
   "servos": [

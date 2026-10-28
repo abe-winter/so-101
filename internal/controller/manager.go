@@ -363,16 +363,17 @@ func (h *ControllerHandle) GetJointPositionsForServos(ctx context.Context, servo
 	return out, err
 }
 
+// SetTorqueEnable is intentionally one-way on this torqueless branch. The SO-101 is only a
+// hand-driven leader, so every caller -- initialization and calibration included -- converges
+// the whole bus to torque disabled. Keeping the invariant at the shared-controller boundary
+// prevents a forgotten or future enable call from defeating teleop's leader hold.
 func (h *ControllerHandle) SetTorqueEnable(ctx context.Context, enable bool) error {
+	if enable && h.logger != nil {
+		h.logger.Warn("Torqueless branch: suppressing torque-enable request")
+	}
 	return h.withSession(func(sess *busSession) error {
-		if enable {
-			if err := sess.group.EnableAll(ctx); err != nil {
-				return fmt.Errorf("failed to set torque enable: %w", err)
-			}
-		} else {
-			if err := sess.group.DisableAll(ctx); err != nil {
-				return fmt.Errorf("failed to set torque enable: %w", err)
-			}
+		if err := sess.group.DisableAll(ctx); err != nil {
+			return fmt.Errorf("failed to force torque disabled: %w", err)
 		}
 		return nil
 	})

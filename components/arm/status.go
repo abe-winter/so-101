@@ -129,25 +129,27 @@ func (s *so101) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[
 	// Handle custom commands specific to SO-101
 	switch cmd["command"] {
 	case "set_torque":
-		enable, ok := cmd["enable"].(bool)
+		requestedEnable, ok := cmd["enable"].(bool)
 		if !ok {
 			return nil, fmt.Errorf("set_torque command requires 'enable' boolean parameter")
 		}
-		if err := s.controller.SetTorqueEnable(ctx, enable); err != nil {
-			s.logger.Warnf("set_torque enable=%t write failed: %v", enable, err)
-			return map[string]interface{}{"success": false, "enable": enable}, err
+		if err := s.controller.SetTorqueEnable(ctx, requestedEnable); err != nil {
+			s.logger.Warnf("set_torque requested_enable=%t write failed: %v", requestedEnable, err)
+			return map[string]interface{}{"success": false, "requested_enable": requestedEnable}, err
 		}
-		servos, allMatch := s.torqueEnableReadback(ctx, &enable)
+		effectiveEnable := false
+		servos, allMatch := s.torqueEnableReadback(ctx, &effectiveEnable)
 		if allMatch {
-			s.logger.Infof("set_torque enable=%t confirmed on servos %v", enable, s.armServoIDs)
+			s.logger.Infof("set_torque requested_enable=%t forced enable=false on servos %v", requestedEnable, s.armServoIDs)
 		} else {
-			s.logger.Warnf("set_torque enable=%t readback did not match: %v", enable, servos)
+			s.logger.Warnf("set_torque forced enable=false readback did not match: %v", servos)
 		}
 		return map[string]interface{}{
-			"success":   true,
-			"enable":    enable,
-			"all_match": allMatch,
-			"servos":    servos,
+			"success":          true,
+			"requested_enable": requestedEnable,
+			"enable":           effectiveEnable,
+			"all_match":        allMatch,
+			"servos":           servos,
 		}, nil
 
 	case "get_torque":
