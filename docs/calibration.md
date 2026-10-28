@@ -31,6 +31,11 @@ _If you have already calibrated the servos on this arm, use the `devrel:so101:di
 | `timeout`          | duration | Optional     | Communication timeout. Default: `"5s"`                                                                                          |
 | `servo_ids`        | []int    | Optional     | Servos to calibrate. Defaults to all six (`[1, 2, 3, 4, 5, 6]`).                                                                 |
 
+When `servo_ids` selects a subset, `save_calibration` merges those servos into the existing
+calibration file and preserves every unselected joint. A partial save is refused if that file
+does not already exist and validate; this prevents a gripper-only run from replacing arm-joint
+calibration with defaults.
+
 ## Available Commands
 
 ```json

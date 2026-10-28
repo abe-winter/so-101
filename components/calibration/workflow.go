@@ -339,8 +339,20 @@ func (cs *so101CalibrationSensor) saveCalibration(ctx context.Context) (map[stri
 	calibrationPath := controller.ResolveCalibrationPath(cs.cfg.CalibrationFile)
 	cs.logger.Info("Saving calibration to servos and file...")
 
-	// Create calibration structure
+	// A servo subset is an intentional partial calibration (notably servo 6 by itself). Merge
+	// it into the existing file so saving the subset cannot erase the other joints. Refuse a
+	// partial save when there is no readable baseline; defaults would silently destroy a real
+	// arm calibration on its next rebuild.
 	fullCalibration := controller.SO101FullCalibration{}
+	if len(cs.joints) < 6 {
+		existing, err := controller.LoadFullCalibrationFromFile(calibrationPath, cs.logger)
+		if err != nil {
+			cs.setState(StateCompleted, fmt.Sprintf(
+				"Calibration NOT saved: partial calibration needs an existing calibration file at %s: %v", calibrationPath, err))
+			return map[string]any{"success": false, "message": cs.lastInstruction}, err
+		}
+		fullCalibration = existing
+	}
 
 	for servoID, joint := range cs.joints {
 		motorCal := &servo.MotorCalibration{
