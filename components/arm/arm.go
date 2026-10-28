@@ -230,9 +230,10 @@ type so101 struct {
 
 	motion motion.Service
 
-	cancelCtx  context.Context
-	cancelFunc func()
-	initCtx    context.Context // Context for initialization operations
+	cancelCtx    context.Context
+	cancelFunc   func()
+	backgroundWG sync.WaitGroup
+	initCtx      context.Context // Context for initialization operations
 }
 
 // makeModelFrame builds the SO-101 kinematic model from either the embedded so101.json
@@ -354,11 +355,14 @@ func NewSO101(ctx context.Context, deps resource.Dependencies, name resource.Nam
 		speedDegsPerSec, accelerationDegsPerSec, conf.WaypointLookaheadDeg)
 	logger.Debugf("Arm controlling servo IDs: %v", arm.armServoIDs)
 
-	// Initialize and verify servo connections
+	// Initialize and verify servo connections.
 	if err := arm.initializeServos(); err != nil {
 		ctrl.Release() // Clean up on error
 		return nil, fmt.Errorf("failed to initialize servos: %w", err)
 	}
+
+	arm.backgroundWG.Add(1)
+	go arm.runTorqueWatchdog()
 
 	return arm, nil
 }
@@ -377,11 +381,12 @@ func (s *so101) Close(context.Context) error {
 	s.mu.Unlock()
 
 	s.cancelFunc()
+	s.backgroundWG.Wait()
 	s.controller.Release()
 	return nil
 }
 
-// initializeServos pings each servo and enables torque to ensure proper communication
+// initializeServos pings each servo and applies the branch's forced-torque-off policy.
 func (s *so101) initializeServos() error {
 	return s.initializeServosWithRetry(3)
 }

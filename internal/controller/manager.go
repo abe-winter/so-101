@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -368,8 +369,8 @@ func (h *ControllerHandle) GetJointPositionsForServos(ctx context.Context, servo
 // the whole bus to torque disabled. Keeping the invariant at the shared-controller boundary
 // prevents a forgotten or future enable call from defeating teleop's leader hold.
 func (h *ControllerHandle) SetTorqueEnable(ctx context.Context, enable bool) error {
-	if enable && h.logger != nil {
-		h.logger.Warn("Torqueless branch: suppressing torque-enable request")
+	if h.logger != nil {
+		h.logger.Warnf("Torqueless branch: SetTorqueEnable(%t) forced to false\ncaller:\n%s", enable, debug.Stack())
 	}
 	return h.withSession(func(sess *busSession) error {
 		if err := sess.group.DisableAll(ctx); err != nil {
@@ -475,8 +476,16 @@ func (h *ControllerHandle) LoadForServos(ctx context.Context, servoIDs []int) (o
 	return out, err
 }
 
-// WriteServoRegister writes to a specific servo register by name
+// WriteServoRegister writes to a specific servo register by name. Torque-enable writes are
+// traced and forced off on this branch so the single-servo path cannot bypass SetTorqueEnable.
 func (h *ControllerHandle) WriteServoRegister(ctx context.Context, servoID int, registerName string, data []byte) error {
+	if registerName == "torque_enable" {
+		if h.logger != nil {
+			h.logger.Warnf("Torqueless branch: servo %d torque_enable write %v forced to [0]\ncaller:\n%s",
+				servoID, data, debug.Stack())
+		}
+		data = []byte{0}
+	}
 	return h.withSession(func(sess *busSession) error {
 		servo := sess.group.ServoByID(servoID)
 		if servo == nil {
@@ -495,6 +504,28 @@ func (h *ControllerHandle) SetServoTorque(ctx context.Context, servoID int, enab
 		v = 1
 	}
 	return h.WriteServoRegister(ctx, servoID, "torque_enable", []byte{v})
+}
+
+// EnabledTorqueServos returns the IDs whose live torque_enable register is non-zero. One sync
+// read observes the whole arm, keeping the watchdog's bus cost to one transaction per poll.
+func (h *ControllerHandle) EnabledTorqueServos(ctx context.Context, servoIDs []int) (enabled []int, err error) {
+	err = h.withSessionRead(func(sess *busSession) error {
+		states, readErr := sess.bus.SyncRead(ctx, feetech.RegTorqueEnable.Address, int(feetech.RegTorqueEnable.Size), servoIDs)
+		if _, readErr = tolerateCondition(readErr); readErr != nil {
+			return fmt.Errorf("failed to read torque enable for servos: %w", readErr)
+		}
+		for _, id := range servoIDs {
+			state, ok := states[id]
+			if !ok || len(state) != 1 {
+				return fmt.Errorf("servo %d returned torque_enable width %d", id, len(state))
+			}
+			if state[0] != 0 {
+				enabled = append(enabled, id)
+			}
+		}
+		return nil
+	})
+	return enabled, err
 }
 
 // ReadServoRegister reads a named register from a specific servo.

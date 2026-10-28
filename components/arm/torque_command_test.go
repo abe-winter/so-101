@@ -50,3 +50,25 @@ func TestSetTorqueReportsPerServoReadback(t *testing.T) {
 		assert.Equal(t, false, item.(map[string]interface{})["enabled"])
 	}
 }
+
+func TestTorqueWatchdogRepairsReenabledServos(t *testing.T) {
+	ft := testfake.NewFakeTransport()
+	ids := []int{1, 2, 3, 4, 5}
+	h := testArmHandle(t, ft)
+	s := &so101{
+		controller:  h,
+		armServoIDs: ids,
+		logger:      logging.NewTestLogger(t),
+	}
+	for _, id := range ids {
+		ft.SetRegister(id, feetech.RegTorqueEnable.Address, []byte{1})
+	}
+
+	enabled, err := s.enforceTorqueDisabled(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, ids, enabled)
+
+	remaining, err := h.EnabledTorqueServos(context.Background(), ids)
+	require.NoError(t, err)
+	assert.Empty(t, remaining)
+}

@@ -52,6 +52,11 @@ This experimental branch is **torqueless**: every group torque request writes
 initialization, calibration, teleop teardown, and direct `set_torque` calls. The argument is
 retained for wire compatibility, but it cannot enable the arm.
 
+The hardware arm also sync-reads servos 1-5 every 250 ms. If any register becomes non-zero,
+it logs the IDs and immediately forces the whole bus off again. Every in-module torque write
+is logged with its caller stack; a false-to-true transition without such a write points to a
+device reset, firmware behavior, or another process using the serial port.
+
 ```json
 { "command": "set_torque", "enable": true }
 ```

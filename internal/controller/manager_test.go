@@ -168,6 +168,10 @@ func TestSetTorqueEnableAlwaysDisablesTheBus(t *testing.T) {
 	}
 	h := testHandle(t, ft)
 
+	enabled, err := h.EnabledTorqueServos(context.Background(), []int{1, 2, 3, 4, 5, 6})
+	require.NoError(t, err)
+	assert.Equal(t, []int{1, 2, 3, 4, 5, 6}, enabled)
+
 	require.NoError(t, h.SetTorqueEnable(context.Background(), true))
 	for id := 1; id <= 6; id++ {
 		got, err := h.ReadServoRegister(context.Background(), id, "torque_enable")
