@@ -316,6 +316,7 @@ func (s *service) statusMap(side string) (map[string]interface{}, error) {
 			"gripper_pct":                 st.GripperPct,
 			"blocked":                     st.Blocked,
 			"blocked_reason":              st.BlockedReason,
+			"clutched":                    st.Clutched,
 		}
 		if al := ne.engine.Align(); al != nil {
 			joints := make([]interface{}, len(al.LeaderInputs))

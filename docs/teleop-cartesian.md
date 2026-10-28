@@ -52,6 +52,12 @@ and leaves the leader holding its current pose. A `torque_off` leader deliberate
 teleop never enables torque for an arm used only as an input device, including during service
 replacement and shutdown.
 
+With `wrist_clutch: true`, turning the SO-101 leader's wrist-roll joint (joint 5) to 60°
+or further pauses pose targets. The follower holds its last target while the leader is
+repositioned. Returning the wrist within 45° rebases the mapping and resumes without a jump.
+The fixed 60°/45° hysteresis is intentional for this demo version. Gripper mirroring continues
+while pose mirroring is clutched. The option defaults off.
+
 ## The mapping
 
 ```
@@ -162,6 +168,7 @@ pipeline, and running the pairs as separate services does not change it.
 | `compensate_align_residual` | bool | Optional | Capture the alignment gap so the follower does not move on start. Default `true`. |
 | `align_orientation_weight_mm_per_rad` | number | Optional | How the align IK trades orientation for position: 1 rad of orientation error costs this many mm. Default `50`. |
 | `align_max_position_error_mm` | number | Optional | With `align_on_start`, refuse to start if the leader ends up further than this from the mapped follower pose. Default `0`: best effort, the gap is absorbed and logged. |
+| `wrist_clutch` | bool | Optional | Enable the demo SO-101 joint-5 clutch: pause at 60°, rebase and resume within 45°. Default `false`. |
 | `follower_gripper_mode` | string | Optional | `xarm` (default; DoCommand `{"set": 0..850}` on a `viam:ufactory` gripper), `open_close` (gripper API with hysteresis), or `off`. |
 | `gripper_invert` | bool | Optional | Flip the leader percentage. The SO-101 gripper reports `0` closed / `~95` open, and the leader handle's trigger reads near `0` at rest, so without inversion the follower sits closed and squeezing opens it. Set `true` for squeeze-to-close. |
 | `gripper_range` | number | Optional | Steps at 100 % in `xarm` mode. Default `850`. |

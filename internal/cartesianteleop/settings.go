@@ -82,6 +82,9 @@ type Settings struct {
 	CompensateAlignResidual        *bool                  `json:"compensate_align_residual,omitempty"`           // default true
 	AlignOrientationWeightMMPerRad float64                `json:"align_orientation_weight_mm_per_rad,omitempty"` // default 50
 	AlignMaxPositionErrorMM        float64                `json:"align_max_position_error_mm,omitempty"`         // default 0: best effort, any gap is absorbed
+	// WristClutch pauses pose mirroring while the SO-101 wrist-roll joint is turned past
+	// a fixed threshold. Returning it toward neutral rebases and resumes without a jump.
+	WristClutch bool `json:"wrist_clutch,omitempty"`
 
 	// Gripper.
 	FollowerGripperMode GripperMode `json:"follower_gripper_mode,omitempty"` // default "xarm"
@@ -226,6 +229,7 @@ func (s Settings) Resolve() (Config, error) {
 		ManualOverrides:         s.ManualMode,
 		CompensateResidual:      s.CompensateAlignResidual == nil || *s.CompensateAlignResidual,
 		AlignMaxPositionErrorMM: s.AlignMaxPositionErrorMM, // 0 = best effort, never refuse
+		WristClutch:             s.WristClutch,
 		FollowerGripperMode:     s.FollowerGripperMode,
 		GripperInvert:           s.GripperInvert,
 		GripperRange:            pick(s.GripperRange, 850),

@@ -272,6 +272,9 @@ func TestGripperLockFreezesThePairWhileTheGripperMoves(t *testing.T) {
 
 	// The initial gripper send locks the pair and holds the leader where it is.
 	waitFor(t, func() bool { return e.Status().GripperLocked && len(leader.holdCommands()) == 1 })
+	// A pose send that started before the gripper command may still be completing. Let that
+	// existing command settle before asserting that the active lock suppresses new sends.
+	waitFor(t, func() bool { return !e.inFlight.Load() })
 	hold := leader.holdCommands()[0]
 	test.That(t, hold["torque_limit"], test.ShouldEqual, 250.0)
 	test.That(t, len(hold["joints"].([]interface{})), test.ShouldEqual, 5)

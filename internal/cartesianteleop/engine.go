@@ -48,6 +48,9 @@ type Config struct {
 	AlignOnStart            bool
 	CompensateResidual      bool
 	AlignMaxPositionErrorMM float64
+	// WristClutch enables the demo SO-101 wrist-roll clutch. Thresholds are intentionally
+	// fixed for the first version; false leaves the existing read path unchanged.
+	WristClutch bool
 
 	FollowerGripperMode GripperMode
 	GripperInvert       bool
@@ -85,6 +88,12 @@ const alignReachToleranceDeg = 10.0
 // alignMovedThresholdDeg is the smallest joint change that counts as "the arm moved" when the
 // align move fell short: below it the servos are judged not to be driving at all.
 const alignMovedThresholdDeg = 2.0
+
+const (
+	wristClutchJointIndex = 4
+	wristClutchEngageDeg  = 60.0
+	wristClutchReleaseDeg = 45.0
+)
 
 // maxJointGapDeg returns the largest per-joint |a-b| in degrees and which joint it was.
 func maxJointGapDeg(a, b []referenceframe.Input) (float64, int) {
@@ -147,6 +156,8 @@ type Status struct {
 	BlockedReason string `json:"blocked_reason"`
 	// GripperLocked is true while gripper_lock has the pair frozen.
 	GripperLocked bool `json:"gripper_locked"`
+	// Clutched is true while wrist_clutch is suppressing follower pose targets.
+	Clutched bool `json:"clutched"`
 }
 
 // Engine runs one leader→follower Cartesian mirror session.
@@ -165,6 +176,11 @@ type Engine struct {
 	align       *Alignment
 	startOri    spatialmath.Orientation
 	filter      *Filter
+	// residual starts as the alignment correction and is rebased when the wrist clutch
+	// releases. Alignment remains the immutable record of what Start established.
+	residual     Residual
+	clutched     bool
+	clutchAnchor spatialmath.Pose
 
 	// Debug pose logging (poselog.go): when the run loop last logged its pose line, and the
 	// last target handed to the pipeline.
@@ -193,10 +209,9 @@ type Engine struct {
 	lockUntil  atomic.Int64
 	lockJoints []referenceframe.Input
 
-	// Blocked-follower feedback (nil fb when off). model is the leader's kinematics: with
-	// feedback on, the mirror reads the leader's JOINTS and does forward kinematics itself,
-	// because it must remember joints to pull the leader back to, and reading EndPosition as
-	// well would cost a second bus read per cycle.
+	// Blocked-follower feedback and the wrist clutch both read leader JOINTS and do forward
+	// kinematics locally. That preserves one bus read per cycle; calling EndPosition as well
+	// would read the same joints twice.
 	fb         *feedbackState
 	fbFollower atomic.Pointer[spatialmath.Pose]
 	model      referenceframe.Model
@@ -259,12 +274,24 @@ func (e *Engine) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	e.model = nil
+	if e.cfg.WristClutch {
+		model, modelErr := e.deps.Leader.Kinematics(ctx)
+		if modelErr != nil {
+			e.releaseLeader(ctx)
+			return fmt.Errorf("wrist clutch needs leader kinematics: %w", modelErr)
+		}
+		e.model = model
+	}
 	if err := e.deps.Pipeline.Start(ctx, al.FollowerPose); err != nil {
 		e.releaseLeader(ctx)
 		return err
 	}
 
 	e.align = al
+	e.residual = al.Residual
+	e.clutched = false
+	e.clutchAnchor = nil
 	e.sessionOpen = true
 	e.startOri = al.FollowerPose.Orientation()
 	e.filter = NewFilter(e.cfg.Filter)
@@ -275,10 +302,14 @@ func (e *Engine) Start(ctx context.Context) error {
 	e.lockJoints = nil
 	e.sessionLost.Store(false)
 	e.inFlight.Store(false)
+	e.lastSentPose.Store(nil)
 
 	e.fb = nil
 	if e.cfg.Feedback.Enabled && e.cfg.LeaderHold == HoldManual {
-		model, err := e.deps.Leader.Kinematics(ctx)
+		model := e.model
+		if model == nil {
+			model, err = e.deps.Leader.Kinematics(ctx)
+		}
 		if err != nil {
 			e.deps.Logger.Warnf("blocked feedback off: leader kinematics: %v", err)
 		} else {
@@ -545,7 +576,8 @@ func (e *Engine) closeSessionLocked(ctx context.Context) error {
 		e.deps.Logger.Warnf("%v", err)
 	}
 	e.releaseLeader(ctx)
-	e.running, e.sessionOpen = false, false
+	e.running, e.sessionOpen, e.clutched = false, false, false
+	e.clutchAnchor = nil
 	return firstErr
 }
 
@@ -563,6 +595,7 @@ func (e *Engine) Status() Status {
 		LastRPCMs:         float64(e.lastRPCNanos.Load()) / 1e6,
 		RateHz:            e.cfg.RateHz,
 		GripperPct:        e.lastGripperPct,
+		Clutched:          e.clutched,
 	}
 	if e.filter != nil {
 		st.Deadzoned, st.Rejected = e.filter.Deadzoned, e.filter.Rejected
@@ -641,9 +674,12 @@ func (e *Engine) syncOnce(ctx context.Context) error {
 	var pose spatialmath.Pose
 	var joints []referenceframe.Input
 	var err error
-	if e.fb != nil {
+	if e.fb != nil || e.cfg.WristClutch {
 		if joints, err = e.deps.Leader.JointPositions(ctx, nil); err != nil {
 			return fmt.Errorf("read leader joints: %w", err)
+		}
+		if e.cfg.WristClutch && len(joints) <= wristClutchJointIndex {
+			return fmt.Errorf("wrist clutch needs joint index %d, leader returned %d joints", wristClutchJointIndex, len(joints))
 		}
 		// The same clamp-then-transform the so101 arm's EndPosition does.
 		if pose, err = geometry.ComputeOOBPosition(e.model, joints); err != nil {
@@ -651,6 +687,9 @@ func (e *Engine) syncOnce(ctx context.Context) error {
 		}
 	} else if pose, err = e.deps.Leader.EndPosition(ctx, nil); err != nil {
 		return fmt.Errorf("read leader pose: %w", err)
+	}
+	if e.wristClutchStep(pose, joints) {
+		return e.mirrorGripper(ctx)
 	}
 	target := e.MapTarget(pose)
 	e.maybeLogPose(pose, target)
@@ -677,16 +716,47 @@ func (e *Engine) syncOnce(ctx context.Context) error {
 	return e.mirrorGripper(ctx)
 }
 
+// wristClutchStep updates the fixed-threshold demo clutch and reports whether pose sends
+// remain paused. On release it rebases the session residual so the first resumed target is
+// the last target sent before clutching, not the leader's repositioned pose.
+func (e *Engine) wristClutchStep(pose spatialmath.Pose, joints []referenceframe.Input) bool {
+	if !e.cfg.WristClutch {
+		return false
+	}
+	wristDeg := math.Abs(float64(joints[wristClutchJointIndex])) * 180 / math.Pi
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.clutched {
+		if wristDeg < wristClutchEngageDeg {
+			return false
+		}
+		e.clutched = true
+		e.clutchAnchor = e.align.FollowerPose
+		if last := e.lastSentPose.Load(); last != nil {
+			e.clutchAnchor = *last
+		}
+		e.deps.Logger.Infof("Wrist clutch engaged at %.1f deg", wristDeg)
+		return true
+	}
+	if wristDeg > wristClutchReleaseDeg {
+		return true
+	}
+
+	e.residual = ResidualBetween(e.cfg.Mapping.Forward(pose), e.clutchAnchor)
+	e.filter.Reset()
+	e.clutched = false
+	e.deps.Logger.Infof("Wrist clutch released at %.1f deg", wristDeg)
+	return false
+}
+
 // MapTarget turns a leader end-effector pose into the follower target for this session:
 // mapping, alignment residual, and the rotation lock when rotation is disabled.
 func (e *Engine) MapTarget(leader spatialmath.Pose) spatialmath.Pose {
 	e.mu.Lock()
-	al, startOri := e.align, e.startOri
+	residual, startOri := e.residual, e.startOri
 	e.mu.Unlock()
-	target := e.cfg.Mapping.Forward(leader)
-	if al != nil {
-		target = al.Residual.Apply(target)
-	}
+	target := residual.Apply(e.cfg.Mapping.Forward(leader))
 	if !e.cfg.RotationEnabled && startOri != nil {
 		target = spatialmath.NewPose(target.Point(), startOri)
 	}

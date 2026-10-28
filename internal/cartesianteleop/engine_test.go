@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -705,6 +706,42 @@ func TestCaptureStartMovesNothingAndMirrorsDeltas(t *testing.T) {
 		last := motion.lastMove()
 		return last != nil && last.Point().Sub(followerPose.Point().Add(delta)).Norm() < 0.5
 	})
+}
+
+func TestWristClutchPausesAndResumesFromTheHeldFollowerPose(t *testing.T) {
+	captureModeTests = true
+	defer func() { captureModeTests = false }()
+	m := Mapping{Scale: 1}
+	leaderHome := []referenceframe.Input{0.1, -0.3, 0.6, 0.2, 0}
+	leader := newFakeLeader(t, leaderHome)
+	motion := &fakeMotion{pose: followerPoseReachableBy(t, leader, m, leaderHome)}
+	e := newTestEngine(t, leader, motion, Config{
+		Mapping: m, LeaderHold: HoldStiff, RotationEnabled: true, WristClutch: true,
+	})
+
+	ctx := context.Background()
+	test.That(t, e.Start(ctx), test.ShouldBeNil)
+	defer func() { test.That(t, e.Stop(ctx), test.ShouldBeNil) }()
+	waitFor(t, func() bool { return motion.moveCount() >= 1 && !e.inFlight.Load() })
+	anchor := motion.lastMove()
+
+	leader.setJoints([]referenceframe.Input{0.3, -0.5, 0.7, -0.1, 70 * math.Pi / 180})
+	waitFor(t, func() bool { return e.Status().Clutched })
+	pausedAt, cycles := motion.moveCount(), e.Status().Cycles
+	waitFor(t, func() bool { return e.Status().Cycles >= cycles+5 })
+	test.That(t, motion.moveCount(), test.ShouldEqual, pausedAt)
+
+	// The release threshold is lower than the engage threshold, so 50 degrees remains
+	// clutched instead of chattering between states.
+	leader.setJoints([]referenceframe.Input{0.4, -0.6, 0.5, 0.1, 50 * math.Pi / 180})
+	cycles = e.Status().Cycles
+	waitFor(t, func() bool { return e.Status().Cycles >= cycles+5 })
+	test.That(t, e.Status().Clutched, test.ShouldBeTrue)
+	test.That(t, motion.moveCount(), test.ShouldEqual, pausedAt)
+
+	leader.setJoints([]referenceframe.Input{0.4, -0.6, 0.5, 0.1, 40 * math.Pi / 180})
+	waitFor(t, func() bool { return !e.Status().Clutched && motion.moveCount() > pausedAt })
+	test.That(t, spatialmath.PoseAlmostCoincidentEps(motion.lastMove(), anchor, 1e-3), test.ShouldBeTrue)
 }
 
 func TestLimpLeaderIsAWarningInBestEffortMode(t *testing.T) {
